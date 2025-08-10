@@ -1,131 +1,133 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import date, timedelta
 import json, os
 
-# 상태 정의
-WEIGHTS_DEFAULT = {"off": 0.0, "am": 0.5, "pm": 0.5, "eve": 0.5, "full": 1.0}
-
-def daterange(d0: date, d1: date):
-    cur = d0
-    while cur <= d1:
-        yield cur
-        cur += timedelta(days=1)
-
-def status_to_weight(status: str, weights: Dict[str, float]) -> float:
-    return float(weights.get(status, 0.0))
+# 상태 정의 (가중치)
+WEIGHTS_DEFAULT: Dict[str, float] = {
+    "off": 0.0,  # 불가능
+    "am": 0.5,   # 오전/오후만 가능
+    "pm": 0.5,
+    "full": 1.0  # 하루 가능
+}
 
 @dataclass
-class MemberAvailability:
+class Member:
     name: str
-    by_date: Dict[str, str] = field(default_factory=dict)
+    availability: Dict[str, str] = field(default_factory=dict)  # 날짜별 상태
     submitted: bool = False
-
-@dataclass
-class RoomSettings:
-    num_members: int
-    min_days: int
-    start: str
-    end: str
-    min_daily_quorum: int
-    weights: Dict[str, float] = field(default_factory=lambda: WEIGHTS_DEFAULT.copy())
 
 @dataclass
 class Room:
     room_id: str
-    title: str
-    creator: str
-    settings: RoomSettings
-    members: Dict[str, MemberAvailability] = field(default_factory=dict)
+    host: str
+    start: date
+    end: date
+    min_days: int
+    members: Dict[str, Member] = field(default_factory=dict)
 
-    def all_submitted(self) -> bool:
-        if len(self.members) < self.settings.num_members:
-            return False
-        return sum(1 for m in self.members.values() if m.submitted) >= self.settings.num_members
+    def to_dict(self) -> Dict:
+        return {
+            "room_id": self.room_id,
+            "host": self.host,
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "min_days": self.min_days,
+            "members": {
+                name: {
+                    "availability": m.availability,
+                    "submitted": m.submitted
+                } for name, m in self.members.items()
+            }
+        }
 
-# 저장소
-DATA_DIR = "rooms_data"
-os.makedirs(DATA_DIR, exist_ok=True)
+    @staticmethod
+    def from_dict(data: Dict) -> Room:
+        room = Room(
+            room_id=data["room_id"],
+            host=data["host"],
+            start=date.fromisoformat(data["start"]),
+            end=date.fromisoformat(data["end"]),
+            min_days=data["min_days"],
+            members={}
+        )
+        for name, m in data["members"].items():
+            room.members[name] = Member(
+                name=name,
+                availability=m.get("availability", {}),
+                submitted=m.get("submitted", False)
+            )
+        return room
 
-def room_path(room_id: str) -> str:
-    return os.path.join(DATA_DIR, f"{room_id}.json")
+# 데이터 저장 경로
+ROOMS_DIR = "rooms_data"
+os.makedirs(ROOMS_DIR, exist_ok=True)
 
 def save_room(room: Room) -> None:
-    data = {
-        "room_id": room.room_id,
-        "title": room.title,
-        "creator": room.creator,
-        "settings": {
-            "num_members": room.settings.num_members,
-            "min_days": room.settings.min_days,
-            "start": room.settings.start,
-            "end": room.settings.end,
-            "min_daily_quorum": room.settings.min_daily_quorum,
-            "weights": room.settings.weights
-        },
-        "members": {
-            n: {"name": m.name, "by_date": m.by_date, "submitted": m.submitted}
-            for n, m in room.members.items()
-        }
-    }
-    with open(room_path(room.room_id), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """방 데이터를 JSON으로 저장"""
+    path = os.path.join(ROOMS_DIR, f"{room.room_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(room.to_dict(), f, ensure_ascii=False, indent=2)
 
-def load_room(room_id: str) -> Room | None:
-    p = room_path(room_id)
-    if not os.path.exists(p): return None
-    with open(p, "r", encoding="utf-8") as f:
+def load_room(room_id: str) -> Optional[Room]:
+    """방 데이터 로드"""
+    path = os.path.join(ROOMS_DIR, f"{room_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    settings = RoomSettings(**data["settings"])
-    room = Room(room_id=data["room_id"], title=data["title"], creator=data["creator"], settings=settings)
-    for n, m in data["members"].items():
-        room.members[n] = MemberAvailability(name=m["name"], by_date=m.get("by_date", {}), submitted=m.get("submitted", False))
-    return room
+    return Room.from_dict(data)
 
-# 점수 계산
-def day_scores(room: Room) -> Dict[str, Dict]:
-    start, end, w = date.fromisoformat(room.settings.start), date.fromisoformat(room.settings.end), room.settings.weights
-    out = {}
-    for d in daterange(start, end):
-        ds = d.isoformat()
-        per_member = {n: status_to_weight(m.by_date.get(ds, "off"), w) for n, m in room.members.items()}
-        out[ds] = {"total": sum(per_member.values()), "per_member": per_member}
-    return out
+def daterange(start: date, end: date):
+    """날짜 범위 생성"""
+    for n in range((end - start).days + 1):
+        yield start + timedelta(n)
 
-def best_windows(room: Room, topk=3) -> List[Dict]:
-    sc = day_scores(room)
-    start, end = date.fromisoformat(room.settings.start), date.fromisoformat(room.settings.end)
-    L, quorum, N = room.settings.min_days, room.settings.min_daily_quorum, room.settings.num_members
-    days = [d.isoformat() for d in daterange(start, end)]
-    wins = []
-    for i in range(len(days) - L + 1):
-        win_days = days[i:i+L]
-        score = sum(sc[d]["total"] for d in win_days)
-        picks, feasible = {}, True
-        for d in win_days:
-            ranked = sorted(sc[d]["per_member"].items(), key=lambda x: x[1], reverse=True)
-            chosen = [n for n, w in ranked if w > 0][:max(quorum, 1)]
-            if len(chosen) < quorum: feasible = False
-            chosen_full = [n for n, w in ranked if w > 0][:N]
-            picks[d] = {"quorum_pick": chosen, "max_pick": chosen_full}
-        wins.append({"days": win_days, "score": score, "feasible": feasible, "picks": picks})
-    return sorted(wins, key=lambda x: (x["feasible"], x["score"]), reverse=True)[:topk]
+def compute_best_dates(room: Room) -> List[str]:
+    """날짜별 점수를 계산하고 추천 날짜 순서 반환"""
+    scores: Dict[str, float] = {}
+    for d in daterange(room.start, room.end):
+        date_str = d.isoformat()
+        score = 0.0
+        for m in room.members.values():
+            state = m.availability.get(date_str, "off")
+            score += WEIGHTS_DEFAULT.get(state, 0.0)
+        scores[date_str] = score
+    sorted_dates = sorted(scores, key=lambda k: scores[k], reverse=True)
+    return sorted_dates
 
 def perfect_windows_all_full(room: Room) -> List[List[str]]:
-    start, end, L = date.fromisoformat(room.settings.start), date.fromisoformat(room.settings.end), room.settings.min_days
+    """모든 인원이 최소 기간 이상 전부 가능한 연속 날짜 조합"""
+    start = room.start
+    end = room.end
+    L = room.min_days
     days = [d.isoformat() for d in daterange(start, end)]
-    def all_full(day): return all(m.by_date.get(day) == "full" for m in room.members.values())
-    return [chunk for i in range(len(days)-L+1) if all(all_full(d) for d in (chunk:=days[i:i+L]))]
+
+    def all_full(day):
+        return all(m.availability.get(day) == "full" for m in room.members.values())
+
+    result = []
+    for i in range(len(days) - L + 1):
+        chunk = days[i:i+L]
+        if all(all_full(d) for d in chunk):
+            result.append(chunk)
+    return result
 
 # 관리 유틸
 def clear_member_submission(room: Room, name: str) -> bool:
+    """특정 멤버의 제출 초기화"""
     mv = room.members.get(name)
-    if not mv: return False
-    mv.by_date, mv.submitted = {}, False
-    save_room(room); return True
+    if not mv:
+        return False
+    mv.availability, mv.submitted = {}, False
+    save_room(room)
+    return True
 
 def remove_member(room: Room, name: str) -> bool:
+    """멤버 제거"""
     if name in room.members:
-        del room.members[name]; save_room(room); return True
+        del room.members[name]
+        save_room(room)
+        return True
     return False
