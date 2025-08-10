@@ -47,7 +47,7 @@ def legend():
 def chip(txt):
     return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:6px;display:inline-block">{txt}</span>'
 
-# -------- 매트릭스 렌더 (사람×날짜, 하루에 칸 하나) --------
+# -------- 매트릭스 렌더 --------
 def build_person_day_map(days_seq, names_by_day):
     persons=set()
     for d in days_seq:
@@ -110,6 +110,48 @@ def render_availability_matrix(days_seq, names_by_day, title=None, note=None, ma
 </div>
 """
     st.markdown(html, unsafe_allow_html=True)
+
+# ===== 겹치거나 인접(하루 차이) 구간 병합 =====
+def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
+    """best_windows 결과를 받아 겹치거나 바로 붙는 날짜 구간을 하나로 합쳐서
+    days/score/feasible을 재계산한다."""
+    if not raw_top:
+        return []
+
+    # 1) interval로 변환
+    intervals = []
+    for w in raw_top:
+        start_d = dt.date.fromisoformat(w["days"][0])
+        end_d   = dt.date.fromisoformat(w["days"][-1])
+        intervals.append({"start": start_d, "end": end_d, "days": set(w["days"])})
+
+    # 2) 시작일 기준 정렬 후 병합(겹치거나 하루 인접하면 합침)
+    intervals.sort(key=lambda x: x["start"])
+    merged = []
+    cur = intervals[0]
+    for nxt in intervals[1:]:
+        if nxt["start"] <= cur["end"] + dt.timedelta(days=1):
+            cur["end"]  = max(cur["end"], nxt["end"])
+            cur["days"] |= nxt["days"]
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+
+    # 3) 점수/충족 여부 재계산
+    out = []
+    for m in merged:
+        days_sorted = sorted(list(m["days"]))
+        score = sum(agg_by_day[d]["score"] for d in days_sorted)
+        feasible = all(
+            (agg_by_day[d]["full"] + agg_by_day[d]["am"] + agg_by_day[d]["pm"] + agg_by_day[d]["eve"]) >= quorum
+            for d in days_sorted
+        )
+        out.append({"days": days_sorted, "score": score, "feasible": feasible})
+
+    # 점수 내림차순, 시작일 오름차순
+    out.sort(key=lambda w: (-w["score"], w["days"][0]))
+    return out
 
 # ---------------- Auth ----------------
 def login_ui():
@@ -479,94 +521,53 @@ def room_page():
             chips = " ".join(chip(n) for n in nb.get(key, [])) or "(없음)"
             st.markdown(f"**{label}** · {chips}", unsafe_allow_html=True)
 
-        # --------- 추천 계산 ---------
+        # --------- 추천 계산 (Top‑7 + 병합) ---------
         raw_top = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
-
-        def _overlap(a,b): return bool(set(a)&set(b))
-        def group_union(wins, tol=1e-6):
-            groups=[]
-            for w in wins:
-                placed=False
-                for g in groups:
-                    if abs(w["score"]-g["rep"]["score"])<tol and _overlap(w["days"], g["all_days"]):
-                        g["variants"].append(w)
-                        g["all_days"]=sorted(set(g["all_days"])|set(w["days"]))
-                        rep=g["rep"]
-                        if (w["feasible"] and not rep["feasible"]) or (w["feasible"]==rep["feasible"] and w["days"][0] < rep["days"][0]):
-                            g["rep"]=w
-                        placed=True; break
-                if not placed:
-                    groups.append({"rep":w, "variants":[w], "all_days":list(w["days"])})
-            groups.sort(key=lambda g: (-g["rep"]["score"], g["rep"]["days"][0]))
-            return groups
-
-        collapse_same = st.toggle("겹치는 동일 점수 구간 묶어서 보기(Union)", value=True)
-
-        def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
-            feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
-            if show_select_button:
-                colL, colR = st.columns([5,2])
-                with colL:
-                    st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
-                with colR:
-                    if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
-                        DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
-                        st.success("최종 일정으로 저장했습니다."); _rerun()
-            else:
-                st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
-
-            # 사람별 구간 기여(전체/부분)
-            K = len(days_seq)
-            stats = {}; all_names=set()
-            for d in days_seq:
-                nb_d = names_by_day.get(d, {})
-                for s in ("full","am","pm","eve"):
-                    for name in nb_d.get(s, []):
-                        all_names.add(name)
-                        rec = stats.setdefault(name, {"cnt":0, "lowest":"full"})
-                        rec["cnt"] += 1
-                        rec["lowest"] = min(rec["lowest"], s, key=level_rank)
-            full_ok = [ (n, stats[n]["lowest"]) for n in all_names if stats[n]["cnt"] == K ]
-            part_ok = [ (n, stats[n]["lowest"], stats[n]["cnt"]) for n in all_names if 0 < stats[n]["cnt"] < K ]
-            full_ok.sort(key=lambda x: (-level_rank(x[1]), x[0].lower()))
-            part_ok.sort(key=lambda x: (-x[2], -level_rank(x[1]), x[0].lower()))
-            level_label={"full":"하루종일","am":"7시간","pm":"5시간","eve":"3시간/모름"}
-            chips_full = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)}") for n,lvl in full_ok) or "(없음)"
-            st.markdown("가능 멤버(구간 **전체**): " + chips_full, unsafe_allow_html=True)
-            if part_ok:
-                chips_part = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)} · {cnt}/{K}일") for n,lvl,cnt in part_ok)
-                st.markdown("가능 멤버(구간 **부분**): " + chips_part, unsafe_allow_html=True)
-
-            # 미니 매트릭스(hover 달력 느낌)
-            render_availability_matrix(
-                days_seq, names_by_day,
-                title=("미니 달력(대안 구간 상세)" if small else "사람×날짜 가능수준 (F/7/5/3/×)"),
-                note=("칸에 마우스를 올리면 상세 상태 툴팁이 보여요." if small else None),
-                max_rows=(8 if small else None)
-            )
-
-        # 출력
         if raw_top:
-            if collapse_same:
-                groups = group_union(raw_top)
-                st.markdown("### ⭐ 추천 Top‑5 (겹치는 동일 점수는 합쳐서 표시)")
-                for i, g in enumerate(groups[:5], 1):
-                    st.write(f"**#{i} 대표 구간**")
-                    union_days = g["all_days"]
-                    render_win_summary(
-                        union_days, g["rep"]["score"], g["rep"]["feasible"],
-                        show_select_button=is_owner
-                    )
-                    if len(g["variants"]) > 1:
-                        with st.expander("같은 점수의 대안 구간 보기", expanded=False):
-                            for v in g["variants"]:
-                                st.markdown(f"- **{v['days'][0]} ~ {v['days'][-1]}** · {'충족' if v['feasible'] else '⚠️'}")
-                                render_win_summary(v["days"], v["score"], v["feasible"], show_select_button=is_owner, small=True)
-            else:
-                st.markdown("### ⭐ 추천 Top‑5 연속 구간")
-                for i, w in enumerate(raw_top[:5], 1):
-                    st.write(f"**#{i}**")
-                    render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
+            merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
+            st.markdown("### ⭐ 추천 Top‑7 (겹치거나 붙는 구간은 하나로 합침)")
+            def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
+                feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
+                if show_select_button:
+                    colL, colR = st.columns([5,2])
+                    with colL:
+                        st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
+                    with colR:
+                        if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
+                            DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
+                            st.success("최종 일정으로 저장했습니다."); _rerun()
+                else:
+                    st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
+
+                K = len(days_seq)
+                stats = {}; all_names=set()
+                for d in days_seq:
+                    nb_d = names_by_day.get(d, {})
+                    for s in ("full","am","pm","eve"):
+                        for name in nb_d.get(s, []):
+                            all_names.add(name)
+                            rec = stats.setdefault(name, {"cnt":0, "lowest":"full"})
+                            rec["cnt"] += 1
+                            rec["lowest"] = min(rec["lowest"], s, key=level_rank)
+                full_ok = [ (n, stats[n]["lowest"]) for n in all_names if stats[n]["cnt"] == K ]
+                part_ok = [ (n, stats[n]["lowest"], stats[n]["cnt"]) for n in all_names if 0 < stats[n]["cnt"] < K ]
+                full_ok.sort(key=lambda x: (-level_rank(x[1]), x[0].lower()))
+                part_ok.sort(key=lambda x: (-x[2], -level_rank(x[1]), x[0].lower()))
+                level_label={"full":"하루종일","am":"7시간","pm":"5시간","eve":"3시간/모름"}
+                chips_full = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)}") for n,lvl in full_ok) or "(없음)"
+                st.markdown("가능 멤버(구간 **전체**): " + chips_full, unsafe_allow_html=True)
+                if part_ok:
+                    chips_part = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)} · {cnt}/{K}일") for n,lvl,cnt in part_ok)
+                    st.markdown("가능 멤버(구간 **부분**): " + chips_part, unsafe_allow_html=True)
+
+            for i, w in enumerate(merged_top[:7], 1):
+                st.write(f"**#{i}**")
+                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
+                render_availability_matrix(
+                    w["days"], names_by_day,
+                    title="사람×날짜 가능수준 (F/7/5/3/×)",
+                    note="칸에 마우스를 올리면 상태 툴팁이 보여요."
+                )
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):
