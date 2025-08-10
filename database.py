@@ -1,4 +1,3 @@
-# db.py
 import sqlite3, os, bcrypt, secrets, string, datetime as dt
 
 DB_PATH = os.environ.get("PLANNER_DB", "planner.sqlite")
@@ -19,15 +18,14 @@ def init_db():
       name  TEXT NOT NULL,
       pw_hash BLOB NOT NULL,
       created_at TEXT NOT NULL
-      -- nickname은 아래에서 조건부 추가
     );
 
     CREATE TABLE IF NOT EXISTS rooms(
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       owner_id INTEGER NOT NULL,
-      start TEXT NOT NULL,  -- YYYY-MM-DD
-      end   TEXT NOT NULL,  -- YYYY-MM-DD
+      start TEXT NOT NULL,
+      end   TEXT NOT NULL,
       min_days INTEGER NOT NULL,
       quorum   INTEGER NOT NULL,
       w_full REAL NOT NULL DEFAULT 1.0,
@@ -41,7 +39,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS memberships(
       user_id INTEGER NOT NULL,
       room_id TEXT NOT NULL,
-      role    TEXT NOT NULL,          -- 'owner' or 'member'
+      role    TEXT NOT NULL,
       submitted INTEGER NOT NULL DEFAULT 0,
       UNIQUE(user_id, room_id),
       FOREIGN KEY(user_id) REFERENCES users(id),
@@ -51,8 +49,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS availability(
       user_id INTEGER NOT NULL,
       room_id TEXT NOT NULL,
-      day TEXT NOT NULL,              -- YYYY-MM-DD
-      status TEXT NOT NULL,           -- off/am/pm/eve/full
+      day TEXT NOT NULL,
+      status TEXT NOT NULL,
       PRIMARY KEY(user_id, room_id, day),
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(room_id) REFERENCES rooms(id)
@@ -60,7 +58,7 @@ def init_db():
     """)
     conn.commit()
 
-    # nickname 컬럼 안전 추가
+    # nickname 안전 추가
     cur.execute("PRAGMA table_info(users)")
     cols = [r[1] for r in cur.fetchall()]
     if "nickname" not in cols:
@@ -74,7 +72,6 @@ def init_db():
     )
     conn.commit()
 
-    # reset tokens
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS reset_tokens(
       token TEXT PRIMARY KEY,
@@ -85,10 +82,9 @@ def init_db():
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
     """)
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-# ---------- Auth primitives ----------
+# ---- Auth primitives ----
 def hash_pw(pw:str)->bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 
@@ -120,7 +116,6 @@ def get_user_by_email(email:str):
     row = cur.fetchone(); conn.close(); return row
 
 def get_user_by_login(login:str):
-    # 이메일 또는 닉네임
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE email=?", (login,))
     row = cur.fetchone()
@@ -139,7 +134,7 @@ def update_password(user_id:int, new_pw:str):
     cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(new_pw), user_id))
     conn.commit(); conn.close()
 
-# reset token APIs
+# reset token
 def create_reset_token(email:str, ttl_minutes:int=30):
     user = get_user_by_email(email)
     if not user: return None, "no_user"
@@ -148,8 +143,7 @@ def create_reset_token(email:str, ttl_minutes:int=30):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("INSERT INTO reset_tokens(token,user_id,expires_at,used,created_at) VALUES(?,?,?,?,?)",
                 (token, user["id"], expires, 0, dt.datetime.utcnow().isoformat()))
-    conn.commit(); conn.close()
-    return token, "ok"
+    conn.commit(); conn.close(); return token, "ok"
 
 def verify_reset_token(token:str):
     conn = get_conn(); cur = conn.cursor()
@@ -166,7 +160,7 @@ def consume_reset_token(token:str):
     cur.execute("UPDATE reset_tokens SET used=1 WHERE token=?", (token,))
     conn.commit(); conn.close()
 
-# ---------- Rooms / Memberships ----------
+# ---- Rooms / Members ----
 def gen_room_id(n=6):
     alpha = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alpha) for _ in range(n))
@@ -236,7 +230,7 @@ def remove_member(room_id:str, user_id:int):
     cur.execute("DELETE FROM memberships WHERE user_id=? AND room_id=?", (user_id, room_id))
     conn.commit(); conn.close()
 
-# ---------- Availability / Submission ----------
+# ---- Availability / Submission ----
 def get_weights(room):
     return dict(full=room["w_full"], am=room["w_am"], pm=room["w_pm"], eve=room["w_eve"], off=0.0)
 

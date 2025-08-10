@@ -1,10 +1,3 @@
-# auth.py
-"""
-인증 로직 레이어:
-- 회원가입(중복 방지)
-- 로그인(이메일 또는 닉네임)
-- 비밀번호 재설정 토큰 발급/검증
-"""
 import database as DB
 
 def register_user(email: str, name: str, nickname: str, password: str):
@@ -20,7 +13,7 @@ def register_user(email: str, name: str, nickname: str, password: str):
             return False, "이미 가입된 이메일입니다."
         if str(e) == "nickname_taken":
             return False, "이미 사용 중인 닉네임입니다."
-        return False, "회원가입 중 알 수 없는 오류가 발생했습니다."
+        return False, "회원가입 중 오류가 발생했습니다."
 
 def login_user(login_id: str, password: str):
     row = DB.get_user_by_login(login_id)
