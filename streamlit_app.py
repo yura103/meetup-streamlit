@@ -21,6 +21,7 @@ COLOR = {
     "eve":  {"bg":"#26C6DA","fg":"#000000","label":"3시간 이상 / 잘 모르겠다(0.4)"},
     "full": {"bg":"#B038FF","fg":"#FFFFFF","label":"하루종일(1.0)"},
 }
+STATUS_ORDER = ["off","eve","pm","am","full"]  # 낮은→높은
 STATUS_OPTIONS = ["off","am","pm","eve","full"]
 
 def badge(status, text=None):
@@ -28,10 +29,34 @@ def badge(status, text=None):
     return f'<span style="background:{c["bg"]};color:{c["fg"]};padding:4px 8px;border-radius:8px;">{t}</span>'
 
 def legend():
+    st.markdown("""
+<style>
+.badge{padding:4px 10px;border-radius:10px;margin-right:6px;color:#111;display:inline-block}
+.boxrow{display:flex;gap:4px}
+.box{width:16px;height:14px;border-radius:3px;border:1px solid rgba(0,0,0,.08)}
+.ttwrap{position:relative;display:inline-block}
+.ttwrap .tt{visibility:hidden;opacity:0;transition:.12s;position:absolute;z-index:50;left:0;top:24px;background:#fff;border:1px solid #ddd;border-radius:10px;padding:8px 10px;box-shadow:0 4px 12px rgba(0,0,0,.12)}
+.ttwrap:hover .tt{visibility:visible;opacity:1}
+.ttgrid{display:grid;grid-auto-flow:column;gap:4px}
+.ttname{white-space:nowrap;font-size:12px;color:#666;margin-right:8px}
+.ttrow{display:flex;align-items:center;margin:2px 0}
+.ttsq{width:14px;height:12px;border-radius:3px;border:1px solid rgba(0,0,0,.08);margin-right:2px}
+</style>
+    """, unsafe_allow_html=True)
+
     cols = st.columns(5)
     for status, col in zip(STATUS_OPTIONS, cols):
         with col: st.markdown(badge(status), unsafe_allow_html=True)
     st.caption("색상: 불가=검정 / 7시간=노랑 / 5시간=연두 / 3시간=청록 / 하루종일=보라")
+
+def level_rank(s): return {"off":0,"eve":1,"pm":2,"am":3,"full":4}.get(s,0)
+
+def status_square(status):
+    c = COLOR[status]
+    return f'<span class="box" style="background:{c["bg"]};"></span>'
+
+def chip(txt):
+    return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:6px;display:inline-block">{txt}</span>'
 
 # ---------------- Auth ----------------
 def login_ui():
@@ -153,10 +178,86 @@ def room_page():
 
     is_owner = (room["owner_id"] == st.session_state["user_id"])
 
-    # 헤더 + 레전드
+    # 헤더 + 레전드 + CSS
     st.header(f"방: {room['title']} ({rid})")
     st.caption(f"{room['start']} ~ {room['end']} / 최소{room['min_days']}일 / 쿼럼{room['quorum']}")
     legend()
+
+    # ----- 사이드바: 공지 & 투표 -----
+    with st.sidebar:
+        st.header("🗞 공지 & 🗳 투표")
+
+        st.subheader("📌 공지사항")
+        anns = DB.list_announcements(rid)
+        pinned = [a for a in anns if a["pinned"]]
+        for a in pinned[:2]:
+            st.info(f"**{a['title']}**\n\n{a['body']}")
+        with st.expander("전체 공지 보기", expanded=False):
+            for a in anns:
+                st.markdown(f"**{a['title']}**  · {a['created_at'][:16].replace('T',' ')}")
+                st.caption(a["body"])
+                if is_owner:
+                    c1,c2 = st.columns(2)
+                    with c1:
+                        if st.button(("고정 해제" if a["pinned"] else "고정"), key=f"pin_{a['id']}"):
+                            DB.toggle_pin_announcement(a["id"], rid, room["owner_id"]); _rerun()
+                    with c2:
+                        if st.button("삭제", key=f"delann_{a['id']}"):
+                            DB.delete_announcement(a["id"], rid, room["owner_id"]); _rerun()
+                st.markdown("---")
+        if is_owner:
+            st.caption("새 공지")
+            ann_title = st.text_input("제목", key="ann_title_sb")
+            ann_body  = st.text_area("내용", key="ann_body_sb")
+            ann_pin   = st.checkbox("고정", value=False, key="ann_pin_sb")
+            if st.button("등록", key="ann_add_sb"):
+                if ann_title.strip():
+                    DB.add_announcement(rid, ann_title.strip(), ann_body.strip(), int(ann_pin), st.session_state["user_id"])
+                    st.success("등록됨"); _rerun()
+                else:
+                    st.error("제목은 필수예요.")
+        st.markdown("---")
+
+        st.subheader("🗳 투표")
+        polls = DB.list_polls(rid)
+        if not polls:
+            st.caption("진행 중 투표 없음")
+        else:
+            for p in polls:
+                st.markdown(f"**{p['question']}**" + (f" · 마감 {p['closes_at'][:16].replace('T',' ')}" if p["closes_at"] else ""))
+                opts = DB.list_poll_options(p["id"])
+                my_votes = set(DB.get_user_votes(p["id"], st.session_state["user_id"]))
+                if p["is_multi"]:
+                    picked = st.multiselect("선택", [o["id"] for o in opts], default=list(my_votes),
+                                            format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
+                else:
+                    all_ids = [o["id"] for o in opts]
+                    idx = all_ids.index(next(iter(my_votes))) if my_votes else 0
+                    picked = st.radio("선택", all_ids, index=idx,
+                                      format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
+                    picked = [picked]
+                if st.button("투표/변경", key=f"vote_{p['id']}"):
+                    DB.cast_vote(p["id"], picked, st.session_state["user_id"], bool(p["is_multi"]))
+                    st.success("반영됨"); _rerun()
+                counts, total = DB.tally_poll(p["id"])
+                for o in opts:
+                    c = counts.get(o["id"], 0); ratio = (c/total*100) if total else 0
+                    st.progress(min(1.0, ratio/100.0), text=f"{o['text']} · {c}표 ({ratio:0.0f}%)")
+                st.markdown("---")
+        if is_owner:
+            with st.expander("새 투표 만들기", expanded=False):
+                q = st.text_input("질문", key="newpoll_q")
+                raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
+                multi = st.checkbox("다중 선택", value=False, key="newpoll_multi")
+                closes = st.date_input("마감일(선택)", value=None, key="newpoll_date")
+                if st.button("투표 생성", key="newpoll_make"):
+                    options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
+                    closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
+                    if q.strip() and options:
+                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, st.session_state["user_id"])
+                        st.success("투표 생성!"); _rerun()
+                    else:
+                        st.error("질문과 보기 필요")
 
     # ---- 방장 관리 ----
     if is_owner:
@@ -202,7 +303,6 @@ def room_page():
                     st.session_state.pop("room_id", None)
                     _rerun()
 
-        # 멤버 목록/제거
         st.markdown("#### 멤버 목록")
         st.dataframe(
             pd.DataFrame([{
@@ -225,7 +325,7 @@ def room_page():
             if target and st.button("선택 멤버 제거", key="remove_btn"):
                 DB.remove_member(rid, target["id"]); st.success("제거 완료"); _rerun()
 
-    # ---- 탭 구분 ----
+    # ---- 탭 ----
     st.markdown("---")
     tab_time, tab_plan, tab_cost = st.tabs(["⏰ 시간/약속", "🗺️ 계획 & 동선 / 예산", "💳 정산"])
 
@@ -234,7 +334,7 @@ def room_page():
         st.subheader("내 달력 입력")
         my_av = DB.get_my_availability(st.session_state["user_id"], rid)
 
-        # 날짜 범위 → DataFrame
+        # 범위 → DataFrame
         days = []
         d0 = dt.date.fromisoformat(room["start"]); d1 = dt.date.fromisoformat(room["end"])
         cur = d0
@@ -294,9 +394,9 @@ def room_page():
         st.markdown("---")
         st.subheader("집계 및 추천")
 
-        # ---- 이름 포함 집계 ----
+        # 집계 + 이름
         room_row, days_list, agg, weights = DB.day_aggregate(rid)
-        names_by_day = DB.availability_names_by_day(rid)   # 날짜별 상태→이름
+        names_by_day = DB.availability_names_by_day(rid)
 
         df_agg = pd.DataFrame([
             {
@@ -313,62 +413,80 @@ def room_page():
         ])
         st.dataframe(df_agg, use_container_width=True, hide_index=True)
 
-        # 날짜 하나 골라서 뱃지로 보기
-        def chip(txt):
-            return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:4px;display:inline-block">{txt}</span>'
-
+        # 날짜별 뱃지
         st.markdown("#### 날짜별 가능 멤버(뱃지)")
         pick_for_names = st.selectbox("날짜 선택", days_list, index=0, key="names_day_pick")
         nb = names_by_day.get(pick_for_names, {})
-        for label, key in [("하루종일", "full"), ("7시간", "am"), ("5시간", "pm"), ("3시간/모름", "eve")]:
+        for label, key in [("하루종일","full"),("7시간","am"),("5시간","pm"),("3시간/모름","eve")]:
             chips = " ".join(chip(n) for n in nb.get(key, [])) or "(없음)"
             st.markdown(f"**{label}** · {chips}", unsafe_allow_html=True)
 
-        # ---- 추천 구간 계산 ----
+        # --------- 추천 계산 ---------
         raw_top = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
 
-        # 겹치는 동일 점수 구간 묶기 + "날짜 Union"으로 확장
-        def _overlap(a, b):
-            return bool(set(a) & set(b))
+        # 동일 점수 & 겹침 → Union 그룹
+        def _overlap(a,b): return bool(set(a)&set(b))
         def group_union(wins, tol=1e-6):
-            groups = []
+            groups=[]
             for w in wins:
-                placed = False
+                placed=False
                 for g in groups:
-                    if abs(w["score"] - g["rep"]["score"]) < tol and _overlap(w["days"], g["all_days"]):
+                    if abs(w["score"]-g["rep"]["score"])<tol and _overlap(w["days"], g["all_days"]):
                         g["variants"].append(w)
-                        g["all_days"] = sorted(set(g["all_days"]) | set(w["days"]))
-                        # 대표 선정: feasible 우선, 같으면 시작일 빠른 것
-                        rep = g["rep"]
-                        if (w["feasible"] and not rep["feasible"]) or \
-                           (w["feasible"] == rep["feasible"] and w["days"][0] < rep["days"][0]):
-                            g["rep"] = w
-                        placed = True
-                        break
+                        g["all_days"]=sorted(set(g["all_days"])|set(w["days"]))
+                        rep=g["rep"]
+                        if (w["feasible"] and not rep["feasible"]) or (w["feasible"]==rep["feasible"] and w["days"][0] < rep["days"][0]):
+                            g["rep"]=w
+                        placed=True; break
                 if not placed:
-                    groups.append({"rep": w, "variants": [w], "all_days": list(w["days"])})
+                    groups.append({"rep":w, "variants":[w], "all_days":list(w["days"])})
             groups.sort(key=lambda g: (g["rep"]["days"][0], -g["rep"]["score"]))
             return groups
 
-        collapse_same = st.toggle(
-            "겹치는 동일 점수 구간 묶어서 보기(Union)",
-            value=True,
-            help="동일 점수이며 겹치는 구간을 하나로 합쳐서 보여줘요. (예: 09-10 & 10-11 → 09-11)"
-        )
+        collapse_same = st.toggle("겹치는 동일 점수 구간 묶어서 보기(Union)", value=True)
 
-        # 공통: 사람 레벨 비교용
-        def level_rank(s): return {"off":0, "eve":1, "pm":2, "am":3, "full":4}.get(s,0)
-        level_label = {"full":"하루종일", "am":"7시간", "pm":"5시간", "eve":"3시간/모름"}
+        # 미니 타임라인 HTML (사람 x 날짜)
+        def build_person_day_map(days_seq):
+            # invert: name -> {day: status}
+            persons=set()
+            for d in days_seq:
+                for s in ("full","am","pm","eve"):
+                    for n in names_by_day.get(d,{}).get(s, []):
+                        persons.add(n)
+            persons=sorted(persons)
+            pmap={n:{} for n in persons}
+            for d in days_seq:
+                for s in ("full","am","pm","eve"):
+                    for n in names_by_day.get(d,{}).get(s, []):
+                        pmap[n][d]=s
+                # 없는 사람은 off
+                for n in persons:
+                    pmap[n].setdefault(d,"off")
+            return persons,pmap
 
-        # 구간 렌더(합쳐진 days에도 대응)
-        def render_win_with_members(days_seq, score, feasible):
+        def html_mini_timeline(days_seq, persons, pmap, max_rows=8):
+            # header: days
+            day_labels = [d[5:].replace("-","/") for d in days_seq]
+            rows=[]
+            for n in persons[:max_rows]:
+                cells = "".join(f'<span class="ttsq" style="background:{COLOR[pmap[n][d]]["bg"]};"></span>' for d in days_seq)
+                rows.append(f'<div class="ttrow"><span class="ttname">{n}</span>{cells}</div>')
+            if len(persons)>max_rows:
+                rows.append(f'<div class="ttrow"><span class="ttname">+{len(persons)-max_rows} more</span></div>')
+            header = "".join(f'<span class="ttsq" style="background:#fafafa;border:1px solid #eee" title="{d}"></span>' for d in days_seq)
+            return f'''
+<div class="tt">
+  <div style="font-size:12px;color:#999;margin-bottom:4px">{", ".join(day_labels)}</div>
+  {''.join(rows)}
+</div>'''
+
+        def render_win_with_members(days_seq, score, feasible, show_header=True):
             feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
-            st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
+            if show_header:
+                st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
 
             K = len(days_seq)
-            # 사람별 (가능일수, 최저레벨) 집계
-            stats = {}
-            all_names = set()
+            stats = {}; all_names=set()
             for d in days_seq:
                 nb_d = names_by_day.get(d, {})
                 for s in ("full","am","pm","eve"):
@@ -377,55 +495,28 @@ def room_page():
                         rec = stats.setdefault(name, {"cnt":0, "lowest":"full"})
                         rec["cnt"] += 1
                         rec["lowest"] = min(rec["lowest"], s, key=level_rank)
-
             full_ok = [ (n, stats[n]["lowest"]) for n in all_names if stats[n]["cnt"] == K ]
             part_ok = [ (n, stats[n]["lowest"], stats[n]["cnt"]) for n in all_names if 0 < stats[n]["cnt"] < K ]
-
             full_ok.sort(key=lambda x: (-level_rank(x[1]), x[0].lower()))
             part_ok.sort(key=lambda x: (-x[2], -level_rank(x[1]), x[0].lower()))
 
+            level_label={"full":"하루종일","am":"7시간","pm":"5시간","eve":"3시간/모름"}
             chips_full = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)}") for n,lvl in full_ok) or "(없음)"
             st.markdown("가능 멤버(구간 **전체**): " + chips_full, unsafe_allow_html=True)
-
             if part_ok:
-                chips_part = " ".join(
-                    chip(f"{n} · {level_label.get(lvl,lvl)} · {cnt}/{K}일") for n,lvl,cnt in part_ok
-                )
+                chips_part = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)} · {cnt}/{K}일") for n,lvl,cnt in part_ok)
                 st.markdown("가능 멤버(구간 **부분**): " + chips_part, unsafe_allow_html=True)
 
-        # 대안 구간용: 작게 요약(이름 3명까지만)
-        def tiny_member_summary(days_seq):
-            K = len(days_seq)
-            stats = {}
-            all_names = set()
-            for d in days_seq:
-                nb_d = names_by_day.get(d, {})
-                for s in ("full","am","pm","eve"):
-                    for name in nb_d.get(s, []):
-                        all_names.add(name)
-                        rec = stats.setdefault(name, {"cnt":0, "lowest":"full"})
-                        rec["cnt"] += 1
-                        rec["lowest"] = min(rec["lowest"], s, key=level_rank)
-            full_ok = [ (n, stats[n]["lowest"]) for n in all_names if stats[n]["cnt"] == K ]
-            part_ok = [ (n, stats[n]["lowest"], stats[n]["cnt"]) for n in all_names if 0 < stats[n]["cnt"] < K ]
-            full_ok.sort(key=lambda x: (-level_rank(x[1]), x[0].lower()))
-            part_ok.sort(key=lambda x: (-x[2], -level_rank(x[1]), x[0].lower()))
+        # 대안 항목 줄: hover 시 타임라인 툴팁
+        def alt_line_with_tooltip(win):
+            persons, pmap = build_person_day_map(win["days"])
+            tooltip_html = html_mini_timeline(win["days"], persons, pmap)
+            rng = f"{win['days'][0]} ~ {win['days'][-1]}"
+            feas_v = "충족" if win["feasible"] else "⚠️"
+            tiny = f'<span class="ttwrap"> {rng} · {feas_v} {tooltip_html}</span>'
+            st.markdown(f"- {tiny}", unsafe_allow_html=True)
 
-            def join_names(lst, fmt_full=True):
-                if not lst: return ""
-                if fmt_full:
-                    names = [f"{n}·{level_label.get(lvl,lvl)}" for n,lvl in lst[:3]]
-                else:
-                    names = [f"{n}·{level_label.get(lvl,lvl)}·{cnt}/{K}" for n,lvl,cnt in lst[:3]]
-                more = max(0, len(lst)-3)
-                return ", ".join(names) + (f" (+{more})" if more else "")
-            a = join_names(full_ok, True)
-            b = join_names(part_ok, False)
-            pieces = []
-            if a: pieces.append(f"전체: {a}")
-            if b: pieces.append(f"부분: {b}")
-            return " | ".join(pieces) if pieces else "멤버 없음"
-
+        # 출력
         if raw_top:
             if collapse_same:
                 groups = group_union(raw_top)
@@ -434,13 +525,10 @@ def room_page():
                     union_days = g["all_days"]
                     st.write(f"**#{i} 대표 구간**")
                     render_win_with_members(union_days, g["rep"]["score"], g["rep"]["feasible"])
-                    # 구성 구간(대안) 리스트 + 미니 멤버 요약
                     if len(g["variants"]) > 1:
                         with st.expander("같은 점수의 대안 구간 보기"):
                             for v in g["variants"]:
-                                rng = f"{v['days'][0]} ~ {v['days'][-1]}"
-                                feas_v = "충족" if v["feasible"] else "⚠️"
-                                st.caption(f"- {rng} · {feas_v} · {tiny_member_summary(v['days'])}")
+                                alt_line_with_tooltip(v)
             else:
                 st.markdown("### ⭐ 추천 Top‑5 연속 구간")
                 for i, w in enumerate(raw_top[:5], 1):
@@ -451,18 +539,32 @@ def room_page():
         if DB.all_submitted(rid):
             st.success("모든 인원이 제출 완료! 위 추천 구간을 참고해 최종 확정하세요 ✅")
 
+        # --- (옵션) 전체 타임라인 뷰 ---
+        if st.toggle("사람별 타임라인(전체 기간) 보기", value=False):
+            names_map = DB.availability_names_by_day(rid)
+            # 전체 인원 목록
+            all_people = sorted({nm for d in names_map.values() for k in d for nm in d[k]})
+            # 이름 -> day -> status
+            pmap={n:{} for n in all_people}
+            for d in days_list:
+                for s in ("full","am","pm","eve"):
+                    for n in names_map.get(d,{}).get(s,[]): pmap[n][d]=s
+                for n in all_people:
+                    pmap[n].setdefault(d,"off")
+            # 렌더
+            for n in all_people:
+                cells = "".join(f'<span class="ttsq" style="background:{COLOR[pmap[n][d]]["bg"]};"></span>' for d in days_list)
+                st.markdown(f'<div class="ttrow"><span class="ttname">{n}</span>{cells}</div>', unsafe_allow_html=True)
+
     # ========== 🗺️ 계획 & 동선 / 예산 ==========
     with tab_plan:
         left, right = st.columns([1.1, 1.2])
 
-        # 날짜 선택
         days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
         pick_day = st.selectbox("날짜 선택", days_options, index=0, key="plan_day")
 
-        # 좌: 계획표 + 검색/추가
         with left:
             st.subheader("계획표 (순서·시간·카테고리·장소·예산)")
-
             with st.expander("📍 장소 검색해서 추가", expanded=False):
                 q = st.text_input("장소/주소 검색", key="plan_q")
                 cA,cB,cC = st.columns([2,1,1])
@@ -482,8 +584,6 @@ def room_page():
                         st.success("추가됨"); _rerun()
 
             rows = DB.list_items(rid, pick_day)
-
-            # 화면 표시용 연속 번호 추가
             table = []
             for r in rows:
                 table.append({
@@ -553,7 +653,6 @@ def room_page():
                             DB.bulk_save_positions(rid, pick_day, repacked)
                         st.success("삭제 및 순서 재정렬 완료"); _rerun()
 
-        # 우: 지도
         with right:
             st.subheader("동선 지도")
             items = DB.list_items(rid, pick_day)
@@ -569,19 +668,16 @@ def room_page():
                     if it["lat"] and it["lon"]:
                         coords.append((it["lat"], it["lon"]))
                         popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
-                        folium.Marker(
-                            [it["lat"], it["lon"]],
-                            popup=popup, tooltip=popup,
-                            icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")
-                        ).add_to(m)
+                        folium.Marker([it["lat"], it["lon"]],
+                                      popup=popup, tooltip=popup,
+                                      icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")).add_to(m)
                 if len(coords)>=2:
                     folium.PolyLine(coords, weight=4, opacity=0.8).add_to(m)
                 st_folium(m, height=520, width=None)
 
-    # ========== 💳 정산 (좌: 지출, 우: 요약) ==========
+    # ========== 💳 정산 ==========
     with tab_cost:
         left, right = st.columns([1.2, 1])
-
         with left:
             st.subheader("지출 입력")
             days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
@@ -618,7 +714,6 @@ def room_page():
             transfers, total = DB.settle_transfers(rid)
             per_head = int(total / max(1, len(members)))
             st.caption(f"총 지출: **{int(total)}원** · 인당 **{per_head}원**")
-
             if not transfers:
                 st.info("정산할 항목이 아직 없어요.")
             else:
