@@ -1,212 +1,279 @@
-import streamlit as st
-from datetime import date, timedelta
-import random, string, pandas as pd, math
-from streamlit.components.v1 import html as components_html
+# streamlit_app.py
+import streamlit as st, pandas as pd, datetime as dt
+from db import init_db, get_user_by_email, create_user, check_pw, get_user, \
+               create_room, list_my_rooms, get_room, invite_user_by_email, \
+               upsert_availability, get_my_availability, clear_my_availability, \
+               day_aggregate, remove_member, delete_room, update_room, \
+               set_submitted, all_submitted
+from planner_core import best_windows
 
-from planner_core import (
-    Room, RoomSettings, MemberAvailability,
-    save_room, load_room, WEIGHTS_DEFAULT,
-    daterange, best_windows, perfect_windows_all_full,
-    clear_member_submission, remove_member
-)
+st.set_page_config(page_title="친구 약속 잡기", layout="wide")
+init_db()
 
-st.set_page_config(page_title="약속/여행 날짜 잡기", layout="wide")
-
-# ---------------- Utils ----------------
-def gen_room_id(n=6):
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
-
-def date_df(start: date, end: date, existing: dict[str,str]|None=None) -> pd.DataFrame:
-    return pd.DataFrame([{"date": d.isoformat(), "status": (existing or {}).get(d.isoformat(), "off")}
-                         for d in daterange(start, end)])
-
-STATUS_OPTIONS = {
-    "불가(검정)": "off",
-    "오전만(초록)": "am",
-    "오후만(초록)": "pm",
-    "저녁만(초록)": "eve",
-    "하루종일(보라/분홍)": "full",
+# ---------- 스타일/색 ----------
+COLOR = {
+    "off": {"bg":"#000000","fg":"#FFFFFF","label":"불가"},
+    "am":  {"bg":"#FFD54F","fg":"#000000","label":"오전(0.3)"},   # 노랑
+    "pm":  {"bg":"#C6FF00","fg":"#000000","label":"점심(0.1)"},   # 연두
+    "eve": {"bg":"#26C6DA","fg":"#000000","label":"저녁(0.5)"},   # 청록
+    "full":{"bg":"#B038FF","fg":"#FFFFFF","label":"하루(1.0)"},   # 보라
 }
+STATUS_OPTIONS = ["off","am","pm","eve","full"]
 
-COLOR_MAP = {
-    "off":   {"bg":"#000000","fg":"#FFFFFF","label":"불가"},
-    "am":    {"bg":"#2ecc71","fg":"#000000","label":"오전"},
-    "pm":    {"bg":"#2ecc71","fg":"#000000","label":"오후"},
-    "eve":   {"bg":"#2ecc71","fg":"#000000","label":"저녁"},
-    "full":  {"bg":"#b038ff","fg":"#FFFFFF","label":"가능"},
-}
+def badge(status, text=None):
+    c = COLOR[status]; t = text or c["label"]
+    return f'<span style="background:{c["bg"]};color:{c["fg"]};padding:4px 8px;border-radius:8px;">{t}</span>'
 
-def colored_badge(status: str, text: str):
-    c = COLOR_MAP[status]
-    return f'<span style="background:{c["bg"]};color:{c["fg"]};padding:4px 8px;border-radius:6px;font-size:12px;">{text}</span>'
-
-def render_legend():
-    st.markdown("#### 색상 안내")
+def legend():
     cols = st.columns(5)
-    legend_items = [
-        ("off", "불가 (하루 불가능)"),
-        ("am",  "오전만 가능"),
-        ("pm",  "오후만 가능"),
-        ("eve", "저녁만 가능"),
-        ("full","하루 종일 가능"),
-    ]
-    for (status, text), c in zip(legend_items, cols):
-        with c:
-            st.markdown(colored_badge(status, COLOR_MAP[status]["label"]), unsafe_allow_html=True)
-            st.caption(text)
+    for status, col in zip(STATUS_OPTIONS, cols):
+        with col: st.markdown(badge(status), unsafe_allow_html=True)
+    st.caption("색상 의미: 불가=검정 / 오전=노랑 / 점심=연두 / 저녁=청록 / 하루=보라")
 
-def preview_calendar(df: pd.DataFrame, title="내 달력 미리보기"):
-    st.markdown(f"### {title}")
-    df2 = df.copy()
-    df2["표시"] = [colored_badge(s, s.upper()) for s in df2["status"]]
-    st.write(df2[["date","표시"]].to_html(escape=False, index=False), unsafe_allow_html=True)
+# ---------- Auth ----------
+def logout():
+    for k in ("user_id","user_name","user_email","page","room_id"): st.session_state.pop(k, None)
 
-def aggregate_by_date(room: Room) -> pd.DataFrame:
-    start = date.fromisoformat(room.settings.start)
-    end   = date.fromisoformat(room.settings.end)
-    w = room.settings.weights
-    rows = []
-    for ds in [d.isoformat() for d in daterange(start, end)]:
-        counts = {k:0 for k in ["off","am","pm","eve","full"]}
-        for mv in room.members.values():
-            counts[mv.by_date.get(ds, "off")] += 1
-        score = (counts["full"] * w["full"] + (counts["am"]+counts["pm"]+counts["eve"]) * w["am"])
-        quorum_now = counts["full"] + counts["am"] + counts["pm"] + counts["eve"]
-        quorum_met = quorum_now >= room.settings.min_daily_quorum
-        rows.append({
-            "date": ds,
-            "full": counts["full"],
-            "half": counts["am"]+counts["pm"]+counts["eve"],
-            "off": counts["off"],
-            "score": round(score, 2),
-            "quorum_ok": "✅" if quorum_met else "❌"
-        })
-    return pd.DataFrame(rows).sort_values("date")
+def require_login():
+    if "user_id" not in st.session_state:
+        st.experimental_rerun()
 
-def auto_refresh(toggle: bool, ms: int = 5000):
-    if toggle:
-        components_html(f"<script>setTimeout(()=>window.parent.location.reload(), {ms});</script>", height=0)
+def login_ui():
+    st.header("로그인 / 회원가입")
+    tab1, tab2 = st.tabs(["로그인", "회원가입"])
 
-# ---------------- Sidebar ----------------
-mode = st.sidebar.radio("모드 선택", ["만들기(Create)","참여하기(Join)"])
-st.sidebar.markdown("---")
-st.sidebar.caption("색 코딩: 불가=검정, 반만=초록, 가능=보라/분홍")
+    with tab1:
+        email = st.text_input("이메일")
+        pw = st.text_input("비밀번호", type="password")
+        if st.button("로그인"):
+            row = get_user_by_email(email)
+            if not row or not check_pw(pw, row["pw_hash"]):
+                st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
+            else:
+                st.session_state.update(user_id=row["id"], user_name=row["name"], user_email=row["email"], page="dashboard")
+                st.experimental_rerun()
 
-# ---------------- Create ----------------
-if mode == "만들기(Create)":
-    st.header("새 약속 방 만들기")
-    colA, colB = st.columns([2,1])
-    with colA:
-        title = st.text_input("방 제목", value="여행/약속 후보일")
-        host  = st.text_input("호스트 이름", value="host")
-        num_members = st.number_input("인원 수", 2, 50, 4, step=1)
-        min_days    = st.number_input("최소 연속 일수", 1, 30, 2, step=1)
-        start = st.date_input("가능 시작일", date.today())
-        end   = st.date_input("가능 종료일", date.today()+timedelta(days=14))
-        if start > end: st.error("시작일이 종료일보다 뒤예요.")
-    with colB:
-        default_quorum = max(2, math.ceil(num_members*0.6))
-        quorum = st.number_input("일자별 최소 모임 인원", 1, int(num_members), int(default_quorum))
-        w_full = st.number_input("하루종일 가능 가중치", 0.0, 2.0, 1.0, 0.1)
-        w_half = st.number_input("반만 가능 가중치", 0.0, 2.0, 0.5, 0.1)
-        weights = {"off":0.0, "am":w_half, "pm":w_half, "eve":w_half, "full":w_full}
-    if st.button("방 생성"):
-        rid = gen_room_id()
-        settings = RoomSettings(num_members, min_days, start.isoformat(), end.isoformat(), quorum, weights)
-        room = Room(rid, title, host, settings)
-        save_room(room)
-        st.success(f"방 코드: **{rid}** (참여자는 '참여하기'에서 입력)")
+    with tab2:
+        name = st.text_input("이름")
+        email2 = st.text_input("이메일(회원가입)")
+        pw2 = st.text_input("비밀번호(6자 이상)", type="password")
+        if st.button("회원가입"):
+            if len(name.strip())<1: st.error("이름을 입력해주세요."); return
+            if len(pw2) < 6: st.error("비밀번호는 6자 이상"); return
+            if get_user_by_email(email2): st.error("이미 가입된 이메일"); return
+            create_user(email2, name, pw2)
+            st.success("가입 완료! 로그인해주세요.")
 
-# ---------------- Join ----------------
-else:
-    st.header("약속 방 참여하기 / 입력")
-    rid_input = st.text_input("방 코드 입력")
-    me_input  = st.text_input("내 이름")
-    if st.button("불러오기"):
-        st.session_state["rid"], st.session_state["me"] = rid_input.strip(), me_input.strip()
-    rid, me = st.session_state.get("rid"), st.session_state.get("me")
-    if not rid or not me: st.stop()
+# ---------- Dashboard ----------
+def dashboard():
+    require_login()
+    st.header(f"안녕, {st.session_state['user_name']}님 👋")
+    if st.button("로그아웃"): logout(); st.experimental_rerun()
 
-    room = load_room(rid)
-    if not room: st.error("방을 찾을 수 없어요."); st.stop()
+    st.subheader("내 방")
+    rows = list_my_rooms(st.session_state["user_id"])
+    if not rows:
+        st.info("아직 방이 없어요. 아래에서 새로 만들어보세요!")
+    else:
+        for r in rows:
+            col1,col2,col3,col4 = st.columns([3,3,2,2])
+            with col1: st.write(f"**{r['title']}**  (`{r['id']}`)")
+            with col2: st.caption(f"{r['start']} ~ {r['end']} / 최소{r['min_days']}일 / 쿼럼{r['quorum']}")
+            role = "👑 소유자" if r["role"]=="owner" else "👥 멤버"
+            sub  = "✅ 제출" if r["submitted"] else "⏳ 미제출"
+            with col3: st.write(role + " · " + sub)
+            with col4:
+                if st.button("입장", key=f"enter_{r['id']}"):
+                    st.session_state["room_id"]=r["id"]; st.session_state["page"]="room"; st.experimental_rerun()
 
-    st.subheader(f"방: {room.title} | 인원 {len(room.members)}/{room.settings.num_members}")
-    st.caption(f"{room.settings.start} ~ {room.settings.end} / 최소 연속일수 {room.settings.min_days} / 최소 인원 {room.settings.min_daily_quorum}")
-    render_legend()
+    st.markdown("---")
+    st.subheader("방 만들기")
+    with st.form("create_room_form"):
+        title = st.text_input("방 제목", value="우리 약속")
+        colA,colB = st.columns(2)
+        with colA: start = st.date_input("시작", value=dt.date.today())
+        with colB: end   = st.date_input("끝", value=dt.date.today()+dt.timedelta(days=14))
+        colC,colD,colE = st.columns(3)
+        with colC: min_days = st.number_input("최소 연속 일수", 1, 30, 2)
+        with colD: quorum   = st.number_input("일자별 최소 모임 인원", 1, 100, 2)
+        with colE: wfull    = st.number_input("가중치: 하루", 0.0, 2.0, 1.0, 0.1)
+        colF,colG,colH = st.columns(3)
+        with colF: wam = st.number_input("가중치: 오전", 0.0, 1.0, 0.3, 0.1)
+        with colG: wpm = st.number_input("가중치: 점심", 0.0, 1.0, 0.1, 0.1)
+        with colH: wev = st.number_input("가중치: 저녁", 0.0, 1.0, 0.5, 0.1)
+        submitted = st.form_submit_button("방 생성")
+        if submitted:
+            rid = create_room(st.session_state["user_id"], title, start.isoformat(), end.isoformat(),
+                              int(min_days), int(quorum), wfull, wam, wpm, wev)
+            st.success(f"방 생성! 코드: **{rid}**")
+            st.experimental_rerun()
 
-    existing = room.members.get(me).by_date if me in room.members else {}
-    df = date_df(date.fromisoformat(room.settings.start), date.fromisoformat(room.settings.end), existing)
-    inv = {v:k for k,v in STATUS_OPTIONS.items()}
-    df["상태"] = [inv.get(v, "불가(검정)") for v in df["status"]]
-    edited = st.data_editor(df[["date","상태"]], hide_index=True,
-        column_config={"상태": st.column_config.SelectboxColumn(options=list(STATUS_OPTIONS.keys()))})
-    edited["status"] = [STATUS_OPTIONS[x] for x in edited["상태"]]
-    edited = edited[["date","status"]]
-    preview_calendar(edited)
+# ---------- Room ----------
+def room_page():
+    require_login()
+    rid = st.session_state.get("room_id")
+    room, members = get_room(rid)
+    if not room:
+        st.error("방이 존재하지 않습니다.")
+        st.session_state["page"]="dashboard"; st.session_state.pop("room_id",None); st.experimental_rerun()
+        return
 
-    c1,c2 = st.columns(2)
-    with c1:
-        if st.button("저장"):
-            mv = room.members.get(me) or MemberAvailability(name=me)
-            mv.by_date, mv.submitted = {r["date"]: r["status"] for _, r in edited.iterrows()}, False
-            room.members[me] = mv; save_room(room); st.success("저장됨")
-    with c2:
-        if st.button("제출"):
-            mv = room.members.get(me) or MemberAvailability(name=me)
-            mv.by_date, mv.submitted = {r["date"]: r["status"] for _, r in edited.iterrows()}, True
-            room.members[me] = mv; save_room(room); st.success("제출 완료")
+    is_owner = (room["owner_id"] == st.session_state["user_id"])
 
-    # 제출 현황
-    sub_dict = {n: "✅" if m.submitted else "⏳" for n,m in room.members.items()}
-    st.write("제출 현황:", sub_dict)
+    st.header(f"방: {room['title']}  ({rid})")
+    st.caption(f"{room['start']} ~ {room['end']} / 최소{room['min_days']}일 / 쿼럼{room['quorum']}")
+    legend()
 
-    # 제출자/대기자 명단
-    subs = [n for n,m in room.members.items() if m.submitted]
-    pend = [n for n,m in room.members.items() if not m.submitted]
-    badge = lambda t: f'<span style="background:#eee;padding:4px 8px;border-radius:12px">{t}</span>'
-    st.markdown("**제출 완료:** " + (" ".join(badge(x) for x in subs) or "없음"), unsafe_allow_html=True)
-    st.markdown("**제출 대기:** " + (" ".join(badge(x) for x in pend) or "없음"), unsafe_allow_html=True)
+    # ----- owner tools -----
+    if is_owner:
+        with st.expander("👑 방 관리 (소유자 전용)", expanded=False):
+            c1,c2,c3 = st.columns(3)
+            with c1: new_title = st.text_input("제목", value=room["title"])
+            with c2: start = st.date_input("시작", dt.date.fromisoformat(room["start"]))
+            with c3: end   = st.date_input("끝", dt.date.fromisoformat(room["end"]))
+            c4,c5,c6,c7 = st.columns(4)
+            with c4: min_days = st.number_input("최소 연속 일수", 1, 30, room["min_days"])
+            with c5: quorum   = st.number_input("일자별 최소 인원", 1, 100, room["quorum"])
+            with c6: wfull    = st.number_input("가중치 하루", 0.0,2.0, float(room["w_full"]),0.1)
+            with c7: pass
+            c8,c9,c10 = st.columns(3)
+            with c8: wam = st.number_input("가중치 오전", 0.0,1.0, float(room["w_am"]),0.1)
+            with c9: wpm = st.number_input("가중치 점심",0.0,1.0, float(room["w_pm"]),0.1)
+            with c10: wev= st.number_input("가중치 저녁",0.0,1.0, float(room["w_eve"]),0.1)
 
-    # 내 제출 관리
-    my_cur = room.members.get(me)
-    if my_cur and my_cur.by_date:
-        with st.expander("내 입력 미리보기"):
-            st.dataframe(pd.DataFrame(sorted(my_cur.by_date.items())), hide_index=True)
+            b1,b2,b3 = st.columns(3)
+            with b1:
+                if st.button("설정 저장"):
+                    ok = update_room(room["owner_id"], rid,
+                                     title=new_title, start=start.isoformat(), end=end.isoformat(),
+                                     min_days=int(min_days), quorum=int(quorum),
+                                     w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev)
+                    st.success("저장 완료" if ok else "변경 없음")
+                    st.experimental_rerun()
+            with b2:
+                inv_email = st.text_input("초대 이메일", key="invite_email")
+                if st.button("초대하기"):
+                    if not inv_email.strip():
+                        st.error("이메일을 입력하세요.")
+                    else:
+                        ok,msg = invite_user_by_email(rid, inv_email.strip())
+                        st.success(msg) if ok else st.error(msg)
+                        st.experimental_rerun()
+            with b3:
+                if st.button("⚠️ 방 삭제", type="secondary"):
+                    delete_room(rid, room["owner_id"])
+                    st.success("방을 삭제했습니다.")
+                    st.session_state["page"]="dashboard"; st.session_state.pop("room_id",None); st.experimental_rerun()
+
+        st.markdown("#### 멤버 목록")
+        tbl = []
+        for m in members:
+            tbl.append({"이름": m["name"], "이메일": m["email"], "역할": m["role"], "제출": "✅" if m["submitted"] else "⏳"})
+        st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
+
+        # 멤버 제거
+        options = ["(선택)"] + [f'{m["name"]} ({m["email"]})' for m in members if m["id"] != room["owner_id"]]
+        pick = st.selectbox("멤버 제거", options)
+        if pick != "(선택)":
+            target_email = pick.split("(")[-1].replace(")","").strip()
+            target = next((m for m in members if m["email"]==target_email), None)
+            if target and st.button("선택 멤버 제거"):
+                remove_member(rid, target["id"]); st.success("제거 완료"); st.experimental_rerun()
+
+    # ----- 내 입력/제출 -----
+    st.markdown("---")
+    st.subheader("내 달력 입력")
+    my_av = get_my_availability(st.session_state["user_id"], rid)
+
+    # 데이터프레임 편집기
+    days = []
+    d0 = dt.date.fromisoformat(room["start"]); d1 = dt.date.fromisoformat(room["end"])
+    cur = d0
+    while cur <= d1:
+        ds = cur.isoformat()
+        days.append({"날짜": ds, "상태": my_av.get(ds, "off")})
+        cur += dt.timedelta(days=1)
+    df = pd.DataFrame(days)
+
+    # 선택지 레이블로 보기 좋게
+    label_map = {"off":"불가(검정)","am":"오전(노랑)","pm":"점심(연두)","eve":"저녁(청록)","full":"하루(보라)"}
+    inv_label = {v:k for k,v in label_map.items()}
+    df["상태(선택)"] = [label_map.get(v, "불가(검정)") for v in df["상태"]]
+
+    edited = st.data_editor(
+        df[["날짜","상태(선택)"]],
+        hide_index=True,
+        column_config={
+            "날짜": st.column_config.TextColumn(disabled=True),
+            "상태(선택)": st.column_config.SelectboxColumn(options=list(label_map.values()))
+        },
+        use_container_width=True,
+    )
+    # 역매핑
+    edited["상태"] = [inv_label[x] for x in edited["상태(선택)"]]
+    payload = {row["날짜"]: row["상태"] for _, row in edited.iterrows()}
+
     c1,c2,c3 = st.columns(3)
     with c1:
-        if st.button("제출 취소"):
-            my_cur.submitted=False; save_room(room); st.experimental_rerun()
+        if st.button("저장"):
+            upsert_availability(st.session_state["user_id"], rid, payload)
+            set_submitted(st.session_state["user_id"], rid, False)
+            st.success("저장 완료(미제출 상태)"); st.experimental_rerun()
     with c2:
-        if st.button("내 입력 삭제"):
-            clear_member_submission(room, me); st.experimental_rerun()
+        if st.button("제출(Submit)"):
+            upsert_availability(st.session_state["user_id"], rid, payload)
+            set_submitted(st.session_state["user_id"], rid, True)
+            st.success("제출 완료"); st.experimental_rerun()
     with c3:
-        if st.button("방 나가기"):
-            if me!=room.creator: remove_member(room, me); st.experimental_rerun()
+        if st.button("내 입력 삭제"):
+            clear_my_availability(st.session_state["user_id"], rid)
+            set_submitted(st.session_state["user_id"], rid, False)
+            st.success("입력을 비웠습니다."); st.experimental_rerun()
 
-    # 호스트 대시보드
-    if me == room.creator:
-        st.markdown("### 👑 호스트 대시보드")
-        auto_refresh(st.checkbox("자동 새로고침", False), 5000)
-        st.dataframe(aggregate_by_date(room), hide_index=True)
-        for i,win in enumerate(best_windows(room),1):
-            st.write(f"{i}. {win['days']} | 점수 {win['score']:.1f} | {'충족' if win['feasible'] else '미충족'}")
-        # 멤버 관리
-        tgt = st.selectbox("멤버 선택", [""]+list(room.members.keys()))
-        if tgt:
-            st.write(room.members[tgt].by_date)
-            cc1,cc2,cc3 = st.columns(3)
-            with cc1:
-                if st.button("제출 해제"): room.members[tgt].submitted=False; save_room(room); st.experimental_rerun()
-            with cc2:
-                if st.button("입력 비우기"): clear_member_submission(room, tgt); st.experimental_rerun()
-            with cc3:
-                if st.button("멤버 제거") and tgt!=room.creator: remove_member(room, tgt); st.experimental_rerun()
+    # 제출 현황/뱃지
+    st.markdown("#### 제출 현황")
+    submitted = [m["name"] for m in members if m["submitted"]]
+    pending   = [m["name"] for m in members if not m["submitted"]]
+    badge_simple = lambda t: f'<span style="background:#eee;padding:4px 8px;border-radius:999px;margin-right:6px">{t}</span>'
+    st.markdown("**제출 완료:** " + (" ".join(badge_simple(n) for n in submitted) or "없음"), unsafe_allow_html=True)
+    st.markdown("**제출 대기:** " + (" ".join(badge_simple(n) for n in pending) or "없음"), unsafe_allow_html=True)
 
-    # 최종 추천
-    if room.all_submitted():
-        st.success("모든 인원 제출 완료!")
-        fulls = perfect_windows_all_full(room)
-        if fulls:
-            st.write("전원 가능 구간:", fulls)
+    # ----- 집계/추천 -----
+    st.markdown("---")
+    st.subheader("집계 및 추천")
+    room_row, days_list, agg, weights = day_aggregate(rid)
+    df_agg = pd.DataFrame([
+        {"date": d, "full": agg[d]["full"], "am": agg[d]["am"], "pm": agg[d]["pm"], "eve": agg[d]["eve"],
+         "score": round(agg[d]["score"],2),
+         "quorum_ok": "✅" if (agg[d]["full"]+agg[d]["am"]+agg[d]["pm"]+agg[d]["eve"])>=room_row["quorum"] else "❌"}
+        for d in days_list
+    ])
+    st.dataframe(df_agg, use_container_width=True, hide_index=True)
+
+    topk = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
+    if topk:
+        st.markdown("### ⭐ 추천 Top-3 연속 구간")
+        for i,win in enumerate(topk, 1):
+            feas = "충족" if win["feasible"] else "⚠️ 최소 인원 미충족 포함"
+            st.write(f"**#{i} | {win['days'][0]} ~ {win['days'][-1]} | 점수 {win['score']:.2f} | {feas}**")
+    else:
+        st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
+
+    # 최종 알림
+    if all_submitted(rid):
+        st.success("모든 인원이 제출 완료! 위 추천 구간을 참고해 최종 확정하세요 ✅")
+
+# ---------- Router ----------
+def router():
+    page = st.session_state.get("page", "auth")
+    if "user_id" not in st.session_state:
+        login_ui()
+    else:
+        if page == "dashboard":
+            dashboard()
+        elif page == "room":
+            room_page()
         else:
-            st.write("가중치 기반 추천:", best_windows(room))
+            st.session_state["page"]="dashboard"; dashboard()
+
+router()
