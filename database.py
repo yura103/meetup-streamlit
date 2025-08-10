@@ -232,7 +232,13 @@ def remove_member(room_id:str, user_id:int):
 
 # ---- Availability / Submission ----
 def get_weights(room):
-    return dict(full=room["w_full"], am=room["w_am"], pm=room["w_pm"], eve=room["w_eve"], off=0.0)
+    return {
+        "full": 1.0,   # 하루종일
+        "am": 0.7,     # 7시간 이상
+        "pm": 0.5,     # 5시간 이상
+        "eve": 0.4,    # 3시간 이상 (잘 모르겠다)
+        "off": 0.0     # 불가
+    }
 
 def upsert_availability(user_id:int, room_id:str, items:dict):
     conn = get_conn(); cur = conn.cursor()
