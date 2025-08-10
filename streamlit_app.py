@@ -6,6 +6,7 @@ from email_utils import send_reset_email
 from streamlit_folium import st_folium
 import folium
 from geopy.geocoders import Nominatim
+from datetime import date, timedelta
 
 st.set_page_config(page_title="친구 약속 잡기", layout="wide")
 DB.init_db()
@@ -113,16 +114,15 @@ def render_availability_matrix(days_seq, names_by_day, title=None, note=None, ma
 
 def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
     """best_windows 결과(raw_top)를 받아, 서로 겹치거나(또는 하루 차이로 인접)하는 구간들을
-    하나의 '합친 구간'으로 만들어 반환한다.
-    각 합친 구간에 대해 days/score/feasible 을 다시 계산한다."""
+    하나의 '합친 구간'으로 만들어 반환한다. 각 합친 구간은 days/score/feasible을 재계산."""
     if not raw_top:
         return []
 
     # raw_top -> interval 리스트로 변환
     intervals = []
     for w in raw_top:
-        start_d = date.fromisoformat(w["days"][0])
-        end_d   = date.fromisoformat(w["days"][-1])
+        start_d = dt.date.fromisoformat(w["days"][0])
+        end_d   = dt.date.fromisoformat(w["days"][-1])
         intervals.append({
             "start": start_d,
             "end":   end_d,
@@ -136,7 +136,7 @@ def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
     merged = []
     cur = intervals[0]
     for nxt in intervals[1:]:
-        if nxt["start"] <= cur["end"] + timedelta(days=1):  # 겹치거나 인접
+        if nxt["start"] <= cur["end"] + dt.timedelta(days=1):  # 겹치거나 인접
             cur["end"] = max(cur["end"], nxt["end"])
             cur["days"] |= nxt["days"]
         else:
