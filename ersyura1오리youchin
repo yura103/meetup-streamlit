@@ -1,0 +1,12 @@
+[35mdatabase.py[m[36m:[m[32m236[m[36m:[m        "full": 1.0,   # [1;31m하루[m종일
+[35mstreamlit_app.py[m[36m:[m[32m19[m[36m:[m    "full": {"bg":"#B038FF","fg":"#FFFFFF","label":"[1;31m하루[m종일(1.0)"},
+[35mstreamlit_app.py[m[36m:[m[32m32[m[36m:[m    st.caption("색상: 불가=검정 / 7시간=노랑 / 5시간=연두 / 3시간=청록 / [1;31m하루[m종일=보라")
+[35mstreamlit_app.py[m[36m:[m[32m126[m[36m:[m        with colE: wfull    = st.number_input("가중치: [1;31m하루[m", 0.0, 2.0, 1.0, 0.1)
+[35mstreamlit_app.py[m[36m:[m[32m128[m[36m:[m        with colF: wam = st.number_input("가중치: [1;31m오전[m", 0.0, 1.0, 0.3, 0.1)
+[35mstreamlit_app.py[m[36m:[m[32m129[m[36m:[m        with colG: wpm = st.number_input("가중치: [1;31m점심[m", 0.0, 1.0, 0.1, 0.1)
+[35mstreamlit_app.py[m[36m:[m[32m130[m[36m:[m        with colH: wev = st.number_input("가중치: [1;31m저녁[m", 0.0, 1.0, 0.5, 0.1)
+[35mstreamlit_app.py[m[36m:[m[32m161[m[36m:[m            with c6: wfull    = st.number_input("가중치 [1;31m하루[m", 0.0,2.0, float(room["w_full"]),0.1)
+[35mstreamlit_app.py[m[36m:[m[32m164[m[36m:[m            with c8: wam = st.number_input("가중치 [1;31m오전[m", 0.0,1.0, float(room["w_am"]),0.1)
+[35mstreamlit_app.py[m[36m:[m[32m165[m[36m:[m            with c9: wpm = st.number_input("가중치 [1;31m점심[m",0.0,1.0, float(room["w_pm"]),0.1)
+[35mstreamlit_app.py[m[36m:[m[32m166[m[36m:[m            with c10: wev= st.number_input("가중치 [1;31m저녁[m",0.0,1.0, float(room["w_eve"]),0.1)
+[35mstreamlit_app.py[m[36m:[m[32m231[m[36m:[m        "full": "[1;31m하루[m종일(1.0)"

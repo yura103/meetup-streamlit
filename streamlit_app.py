@@ -12,13 +12,14 @@ def _rerun():
     else: st.experimental_rerun()
 
 COLOR = {
-    "off": {"bg":"#000000","fg":"#FFFFFF","label":"불가"},
-    "am":  {"bg":"#FFD54F","fg":"#000000","label":"오전(0.3)"},
-    "pm":  {"bg":"#C6FF00","fg":"#000000","label":"점심(0.1)"},
-    "eve": {"bg":"#26C6DA","fg":"#000000","label":"저녁(0.5)"},
-    "full":{"bg":"#B038FF","fg":"#FFFFFF","label":"하루(1.0)"},
+    "off":  {"bg":"#000000","fg":"#FFFFFF","label":"불가(0.0)"},
+    "am":   {"bg":"#FFD54F","fg":"#000000","label":"7시간 이상(0.7)"},
+    "pm":   {"bg":"#C6FF00","fg":"#000000","label":"5시간 이상(0.5)"},
+    "eve":  {"bg":"#26C6DA","fg":"#000000","label":"3시간 이상 / 잘 모르겠다(0.4)"},
+    "full": {"bg":"#B038FF","fg":"#FFFFFF","label":"하루종일(1.0)"},
 }
 STATUS_OPTIONS = ["off","am","pm","eve","full"]
+
 
 def badge(status, text=None):
     c = COLOR[status]; t = text or c["label"]
@@ -28,7 +29,8 @@ def legend():
     cols = st.columns(5)
     for status, col in zip(STATUS_OPTIONS, cols):
         with col: st.markdown(badge(status), unsafe_allow_html=True)
-    st.caption("색상: 불가=검정 / 오전=노랑 / 점심=연두 / 저녁=청록 / 하루=보라")
+    st.caption("색상: 불가=검정 / 7시간=노랑 / 5시간=연두 / 3시간=청록 / 하루종일=보라")
+
 
 def login_ui():
     st.header("로그인 / 회원가입 / 비밀번호 재설정")
@@ -121,11 +123,11 @@ def dashboard():
         colC,colD,colE = st.columns(3)
         with colC: min_days = st.number_input("최소 연속 일수", 1, 30, 2)
         with colD: quorum   = st.number_input("일자별 최소 모임 인원", 1, 100, 2)
-        with colE: wfull    = st.number_input("가중치: 하루", 0.0, 2.0, 1.0, 0.1)
+        with colE: wfull    = st.number_input("가중치: 하루종일", 0.0, 2.0, 1.0, 0.1)
         colF,colG,colH = st.columns(3)
-        with colF: wam = st.number_input("가중치: 오전", 0.0, 1.0, 0.3, 0.1)
-        with colG: wpm = st.number_input("가중치: 점심", 0.0, 1.0, 0.1, 0.1)
-        with colH: wev = st.number_input("가중치: 저녁", 0.0, 1.0, 0.5, 0.1)
+        with colF: wam = st.number_input("가중치: 7시간 이상", 0.0, 1.0, 0.7, 0.1)
+        with colG: wpm = st.number_input("가중치: 5시간 이상", 0.0, 1.0, 0.5, 0.1)
+        with colH: wev = st.number_input("가중치: 3시간 이상/잘 모르겠다", 0.0, 1.0, 0.3, 0.1)
         submitted = st.form_submit_button("방 생성")
         if submitted:
             rid = DB.create_room(st.session_state["user_id"], title, start.isoformat(), end.isoformat(),
@@ -156,12 +158,12 @@ def room_page():
             c4,c5,c6,c7 = st.columns(4)
             with c4: min_days = st.number_input("최소 연속 일수", 1, 30, room["min_days"])
             with c5: quorum   = st.number_input("일자별 최소 인원", 1, 100, room["quorum"])
-            with c6: wfull    = st.number_input("가중치 하루", 0.0,2.0, float(room["w_full"]),0.1)
+            with c6: wfull    = st.number_input("가중치 하루종일", 0.0,2.0, float(room["w_full"]),0.1)
             with c7: pass
             c8,c9,c10 = st.columns(3)
-            with c8: wam = st.number_input("가중치 오전", 0.0,1.0, float(room["w_am"]),0.1)
-            with c9: wpm = st.number_input("가중치 점심",0.0,1.0, float(room["w_pm"]),0.1)
-            with c10: wev= st.number_input("가중치 저녁",0.0,1.0, float(room["w_eve"]),0.1)
+            with c8: wam = st.number_input("가중치 7시간 이상", 0.0,1.0, float(room["w_am"]),0.1)
+            with c9: wpm = st.number_input("가중치 5시간 이상",0.0,1.0, float(room["w_pm"]),0.1)
+            with c10: wev= st.number_input("가중치 3시간 이상/잘 모르겠다",0.0,1.0, float(room["w_eve"]),0.1)
 
             b1,b2,b3 = st.columns(3)
             with b1:
@@ -173,19 +175,19 @@ def room_page():
                     st.success("저장 완료"); _rerun()
             with b2:
                 inv_email = st.text_input("초대 이메일", key="invite_email")
-                if st.button("초대하기"):
-                    email_str = (inv_email or "").strip()
-                    if not email_str:
-                        st.error("이메일을 입력하세요.")
+            if st.button("초대하기"):
+                email_str = (inv_email or "").strip()
+                if not email_str:
+                    st.error("이메일을 입력하세요.")
+                else:
+                    ok, message = DB.invite_user_by_email(rid, email_str)
+                    # 문자열 보장 + 안전한 분기
+                    text = str(message)
+                    if ok:
+                        st.success(text)
                     else:
-                        ok, message = DB.invite_user_by_email(rid, email_str)
-                        # 문자열 보장 + 안전한 분기
-                        text = str(message)
-                        if ok:
-                            st.success(text)
-                        else:
-                            st.error(text)
-                        _rerun()
+                        st.error(text)
+                    _rerun()
 
             with b3:
                 if st.button("⚠️ 방 삭제", type="secondary"):
@@ -220,8 +222,16 @@ def room_page():
         cur += dt.timedelta(days=1)
     df = pd.DataFrame(days)
 
-    label_map = {"off":"불가(검정)","am":"오전(노랑)","pm":"점심(연두)","eve":"저녁(청록)","full":"하루(보라)"}
-    inv_label = {v:k for k,v in label_map.items()}
+    # 데이터 에디터 라벨
+    label_map = {
+        "off":  "불가(0.0)",
+        "am":   "7시간 이상(0.7)",
+        "pm":   "5시간 이상(0.5)",
+        "eve":  "3시간 이상 / 잘 모르겠다(0.4)",
+        "full": "하루종일(1.0)"
+    }
+    inv_label = {v: k for k, v in label_map.items()}
+
     df["상태(선택)"] = [label_map.get(v, "불가(검정)") for v in df["상태"]]
 
     edited = st.data_editor(
