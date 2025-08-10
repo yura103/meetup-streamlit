@@ -111,6 +111,59 @@ def render_availability_matrix(days_seq, names_by_day, title=None, note=None, ma
 """
     st.markdown(html, unsafe_allow_html=True)
 
+def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
+    """best_windows 결과(raw_top)를 받아, 서로 겹치거나(또는 하루 차이로 인접)하는 구간들을
+    하나의 '합친 구간'으로 만들어 반환한다.
+    각 합친 구간에 대해 days/score/feasible 을 다시 계산한다."""
+    if not raw_top:
+        return []
+
+    # raw_top -> interval 리스트로 변환
+    intervals = []
+    for w in raw_top:
+        start_d = date.fromisoformat(w["days"][0])
+        end_d   = date.fromisoformat(w["days"][-1])
+        intervals.append({
+            "start": start_d,
+            "end":   end_d,
+            "days":  set(w["days"]),   # 일자 집합 (합칠 때 union)
+        })
+
+    # 시작일 기준 정렬
+    intervals.sort(key=lambda x: x["start"])
+
+    # 겹치거나 인접(하루 차)하면 병합
+    merged = []
+    cur = intervals[0]
+    for nxt in intervals[1:]:
+        if nxt["start"] <= cur["end"] + timedelta(days=1):  # 겹치거나 인접
+            cur["end"] = max(cur["end"], nxt["end"])
+            cur["days"] |= nxt["days"]
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+
+    # score/feasible 재계산
+    out = []
+    for m in merged:
+        days_sorted = sorted(list(m["days"]))
+        # 점수: 해당 날짜들의 score 합
+        new_score = sum(agg_by_day[d]["score"] for d in days_sorted)
+        # feasible: 모든 날짜가 쿼럼 이상이면 True
+        feasible = True
+        for d in days_sorted:
+            total_ok = (agg_by_day[d]["full"] + agg_by_day[d]["am"] +
+                        agg_by_day[d]["pm"]  + agg_by_day[d]["eve"])
+            if total_ok < quorum:
+                feasible = False
+                break
+        out.append({"days": days_sorted, "score": new_score, "feasible": feasible})
+
+    # 점수 내림차순, 시작일 오름차순으로 정렬
+    out.sort(key=lambda w: (-w["score"], w["days"][0]))
+    return out
+
 # ---------------- Auth ----------------
 def login_ui():
     st.header("로그인 / 회원가입 / 비밀번호 재설정")
@@ -482,25 +535,32 @@ def room_page():
         # --------- 추천 계산 ---------
         raw_top = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
 
-        def _overlap(a,b): return bool(set(a)&set(b))
-        def group_union(wins, tol=1e-6):
-            groups=[]
-            for w in wins:
-                placed=False
-                for g in groups:
-                    if abs(w["score"]-g["rep"]["score"])<tol and _overlap(w["days"], g["all_days"]):
-                        g["variants"].append(w)
-                        g["all_days"]=sorted(set(g["all_days"])|set(w["days"]))
-                        rep=g["rep"]
-                        if (w["feasible"] and not rep["feasible"]) or (w["feasible"]==rep["feasible"] and w["days"][0] < rep["days"][0]):
-                            g["rep"]=w
-                        placed=True; break
-                if not placed:
-                    groups.append({"rep":w, "variants":[w], "all_days":list(w["days"])})
-            groups.sort(key=lambda g: (-g["rep"]["score"], g["rep"]["days"][0]))
-            return groups
+        # 새 옵션: 겹치거나 인접한 구간은 하나로 합치기
+        merge_toggle = st.toggle("겹치거나 바로 붙는 날짜는 하나로 합쳐서 보기", value=True)
 
-        collapse_same = st.toggle("겹치는 동일 점수 구간 묶어서 보기(Union)", value=True)
+        if raw_top:
+            if merge_toggle:
+                merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
+                st.markdown("### ⭐ 합쳐진 추천 Top‑7")
+                for i, w in enumerate(merged_top[:7], 1):
+                    st.write(f"**#{i}**")
+                    render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
+                    render_availability_matrix(
+                        w["days"], names_by_day,
+                        title="사람×날짜 가능수준 (F/7/5/3/×)",
+                        note="칸에 마우스를 올리면 상태 툴팁이 보여요."
+                    )
+            else:
+                st.markdown("### ⭐ 원본 추천 Top‑7 (병합하지 않음)")
+                for i, w in enumerate(raw_top[:7], 1):
+                    st.write(f"**#{i}**")
+                    render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
+                    render_availability_matrix(
+                        w["days"], names_by_day,
+                        title="사람×날짜 가능수준 (F/7/5/3/×)"
+                    )
+        else:
+            st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
 
         def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
             feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
