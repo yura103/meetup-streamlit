@@ -57,20 +57,33 @@ def init_db():
       FOREIGN KEY(room_id) REFERENCES rooms(id)
     );
     """)
-    conn.commit(); conn.close()
+    conn.commit()
+
+    # --- 마이그레이션: users.nickname 컬럼 추가 & 기본 채우기 ---
+    cur.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "nickname" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN nickname TEXT UNIQUE")
+        conn.commit()
+        cur.execute("UPDATE users SET nickname = name WHERE nickname IS NULL")
+        conn.commit()
+
+    conn.close()
 
 # ---------- Auth ----------
 def hash_pw(pw:str)->bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 
 def check_pw(pw:str, pw_hash:bytes)->bool:
-    try: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
-    except Exception: return False
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
+    except Exception:
+        return False
 
-def create_user(email:str, name:str, pw:str):
+def create_user(email:str, name:str, nickname:str, pw:str):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("INSERT INTO users(email,name,pw_hash,created_at) VALUES(?,?,?,?)",
-                (email, name, hash_pw(pw), dt.datetime.utcnow().isoformat()))
+    cur.execute("INSERT INTO users(email,name,nickname,pw_hash,created_at) VALUES(?,?,?,?,?)",
+                (email, name, nickname, hash_pw(pw), dt.datetime.utcnow().isoformat()))
     conn.commit(); uid = cur.lastrowid; conn.close(); return uid
 
 def get_user_by_email(email:str):
@@ -78,12 +91,22 @@ def get_user_by_email(email:str):
     cur.execute("SELECT * FROM users WHERE email=?", (email,))
     row = cur.fetchone(); conn.close(); return row
 
+def get_user_by_login(login:str):
+    """login은 이메일 또는 닉네임."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email=?", (login,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("SELECT * FROM users WHERE nickname=?", (login,))
+        row = cur.fetchone()
+    conn.close(); return row
+
 def get_user(user_id:int):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
     row = cur.fetchone(); conn.close(); return row
 
-# ---------- Rooms ----------
+# ---------- Rooms / Memberships ----------
 def gen_room_id(n=6):
     alpha = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alpha) for _ in range(n))
@@ -97,7 +120,6 @@ def create_room(owner_id:int, title:str, start:str, end:str, min_days:int, quoru
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (rid,title,owner_id,start,end,min_days,quorum,
                  w_full,w_am,w_pm,w_eve,dt.datetime.utcnow().isoformat()))
-    # owner membership
     cur.execute("INSERT OR IGNORE INTO memberships(user_id,room_id,role,submitted) VALUES(?,?,?,0)",
                 (owner_id,rid,"owner"))
     conn.commit(); conn.close(); return rid
@@ -134,7 +156,7 @@ def get_room(room_id:str):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
     room = cur.fetchone()
-    cur.execute("""SELECT u.id,u.name,u.email,m.role,m.submitted
+    cur.execute("""SELECT u.id,u.name,u.email,u.nickname,m.role,m.submitted
                    FROM memberships m JOIN users u ON u.id=m.user_id
                    WHERE m.room_id=? ORDER BY u.name""", (room_id,))
     members = cur.fetchall()
@@ -189,29 +211,24 @@ def all_submitted(room_id:str) -> bool:
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT COUNT(*) AS c FROM memberships WHERE room_id=?", (room_id,))
     total = cur.fetchone()["c"]
+    if total == 0: conn.close(); return False
     cur.execute("SELECT COUNT(*) AS c FROM memberships WHERE room_id=? AND submitted=1", (room_id,))
     done = cur.fetchone()["c"]; conn.close()
-    return (done >= total and total>0)
-
+    return (done >= total)
+    
 def day_aggregate(room_id:str):
     conn = get_conn(); cur = conn.cursor()
-    # room + weights
     cur.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
     room = cur.fetchone()
     w = get_weights(room)
 
-    # date range
-    start = room["start"]; end = room["end"]
-    import datetime as dt
-    d0 = dt.date.fromisoformat(start); d1 = dt.date.fromisoformat(end)
-    days = [(d0 + dt.timedelta(days=i)).isoformat() for i in range((d1-d0).days+1)]
+    import datetime as _dt
+    d0 = _dt.date.fromisoformat(room["start"]); d1 = _dt.date.fromisoformat(room["end"])
+    days = [(d0 + _dt.timedelta(days=i)).isoformat() for i in range((d1-d0).days+1)]
 
-    # pull availability
     cur.execute("SELECT user_id, day, status FROM availability WHERE room_id=?", (room_id,))
-    rows = cur.fetchall()
-    conn.close()
+    rows = cur.fetchall(); conn.close()
 
-    # build agg
     agg = {d: {"full":0,"am":0,"pm":0,"eve":0,"off":0,"score":0.0} for d in days}
     for r in rows:
         if r["day"] in agg:

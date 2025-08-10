@@ -1,4 +1,5 @@
-rooms_data/
 __pycache__/
 *.pyc
-.env
+planner.sqlite
+rooms_data/
+.streamlit/
