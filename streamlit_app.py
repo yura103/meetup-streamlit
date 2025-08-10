@@ -47,7 +47,7 @@ def legend():
 def chip(txt):
     return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:6px;display:inline-block">{txt}</span>'
 
-# -------- 매트릭스 렌더 --------
+# -------- 매트릭스 렌더 (사람×날짜, 하루에 칸 하나) --------
 def build_person_day_map(days_seq, names_by_day):
     persons=set()
     for d in days_seq:
@@ -502,19 +502,20 @@ def room_page():
 
         collapse_same = st.toggle("겹치는 동일 점수 구간 묶어서 보기(Union)", value=True)
 
-        def render_win_summary(days_seq, score, feasible, show_select_button=False):
+        def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
             feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
-            cols = st.columns([5,2]) if show_select_button else [st]
             if show_select_button:
-                with cols[0]:
+                colL, colR = st.columns([5,2])
+                with colL:
                     st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
-                with cols[1]:
+                with colR:
                     if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
                         DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
                         st.success("최종 일정으로 저장했습니다."); _rerun()
             else:
                 st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
 
+            # 사람별 구간 기여(전체/부분)
             K = len(days_seq)
             stats = {}; all_names=set()
             for d in days_seq:
@@ -536,6 +537,14 @@ def room_page():
                 chips_part = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)} · {cnt}/{K}일") for n,lvl,cnt in part_ok)
                 st.markdown("가능 멤버(구간 **부분**): " + chips_part, unsafe_allow_html=True)
 
+            # 미니 매트릭스(hover 달력 느낌)
+            render_availability_matrix(
+                days_seq, names_by_day,
+                title=("미니 달력(대안 구간 상세)" if small else "사람×날짜 가능수준 (F/7/5/3/×)"),
+                note=("칸에 마우스를 올리면 상세 상태 툴팁이 보여요." if small else None),
+                max_rows=(8 if small else None)
+            )
+
         # 출력
         if raw_top:
             if collapse_same:
@@ -548,28 +557,16 @@ def room_page():
                         union_days, g["rep"]["score"], g["rep"]["feasible"],
                         show_select_button=is_owner
                     )
-                    render_availability_matrix(
-                        union_days, names_by_day,
-                        title="사람×날짜 가능수준 (F/7/5/3/×)",
-                        note="칸에 마우스를 올리면 상세 상태 툴팁이 보여요."
-                    )
                     if len(g["variants"]) > 1:
                         with st.expander("같은 점수의 대안 구간 보기", expanded=False):
                             for v in g["variants"]:
                                 st.markdown(f"- **{v['days'][0]} ~ {v['days'][-1]}** · {'충족' if v['feasible'] else '⚠️'}")
-                                render_availability_matrix(v["days"], names_by_day, max_rows=8)
-                                if is_owner and st.button("이 대안 구간 최종 선택", key=f"choose_alt_{v['days'][0]}_{v['days'][-1]}"):
-                                    DB.set_final_window(rid, room["owner_id"], v["days"][0], v["days"][-1])
-                                    st.success("최종 일정으로 저장했습니다."); _rerun()
+                                render_win_summary(v["days"], v["score"], v["feasible"], show_select_button=is_owner, small=True)
             else:
                 st.markdown("### ⭐ 추천 Top‑5 연속 구간")
                 for i, w in enumerate(raw_top[:5], 1):
                     st.write(f"**#{i}**")
                     render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
-                    render_availability_matrix(
-                        w["days"], names_by_day,
-                        title="사람×날짜 가능수준 (F/7/5/3/×)"
-                    )
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):

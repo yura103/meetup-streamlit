@@ -9,6 +9,8 @@ def get_conn():
 
 def init_db():
     conn = get_conn(); cur = conn.cursor()
+
+    # 기본 테이블
     cur.executescript("""
     PRAGMA journal_mode=WAL;
 
@@ -34,7 +36,7 @@ def init_db():
       w_am   REAL NOT NULL DEFAULT 0.3,
       w_pm   REAL NOT NULL DEFAULT 0.1,
       w_eve  REAL NOT NULL DEFAULT 0.5,
-      -- 최종 선택된 기간(선택)
+      -- 최신 코드에서 쓰는 최종 확정 기간(선택)
       final_start TEXT,
       final_end   TEXT,
       created_at TEXT NOT NULL,
@@ -62,7 +64,7 @@ def init_db():
     );
     """)
 
-    # --- itinerary (계획/동선) ---
+    # 계획/동선
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS itinerary_items(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +85,7 @@ def init_db():
     );
     """)
 
-    # --- expenses (지출/정산) ---
+    # 지출/정산
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS expenses(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +101,7 @@ def init_db():
     );
     """)
 
-    # --- announcements (공지) ---
+    # 공지
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS announcements(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,14 +116,14 @@ def init_db():
     );
     """)
 
-    # --- polls (투표) ---
+    # 투표
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS polls(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
       question TEXT NOT NULL,
       is_multi INTEGER NOT NULL DEFAULT 0,
-      closes_at TEXT,            -- optional
+      closes_at TEXT,
       created_by INTEGER,
       created_at TEXT NOT NULL,
       FOREIGN KEY(room_id) REFERENCES rooms(id),
@@ -145,7 +147,7 @@ def init_db():
     );
     """)
 
-    # --- password reset tokens ---
+    # 리셋 토큰
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS reset_tokens(
       token TEXT PRIMARY KEY,
@@ -156,17 +158,34 @@ def init_db():
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
     """)
+
+    # ---- 마이그레이션(컬럼 추가 보정) ----
+    cur.execute("PRAGMA table_info(rooms)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "final_start" not in cols:
+        cur.execute("ALTER TABLE rooms ADD COLUMN final_start TEXT")
+    if "final_end" not in cols:
+        cur.execute("ALTER TABLE rooms ADD COLUMN final_end TEXT")
+
+    cur.execute("PRAGMA table_info(users)")
+    ucols = [r[1] for r in cur.fetchall()]
+    if "nickname" not in ucols:
+        cur.execute("ALTER TABLE users ADD COLUMN nickname TEXT")
+        cur.execute("UPDATE users SET nickname = name WHERE nickname IS NULL OR nickname=''")
+
     conn.commit(); conn.close()
 
 # ---- Auth primitives ----
-import bcrypt as _bcrypt
-def hash_pw(pw:str)->bytes: return _bcrypt.hashpw(pw.encode("utf-8"), _bcrypt.gensalt())
+def hash_pw(pw:str)->bytes:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
+
 def check_pw(pw:str, pw_hash:bytes)->bool:
-    try: return _bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
+    try: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
     except Exception: return False
 
 def email_exists(email:str)->bool:
     c=get_conn().cursor(); c.execute("SELECT 1 FROM users WHERE email=?", (email,)); r=c.fetchone(); c.connection.close(); return bool(r)
+
 def nickname_exists(nick:str)->bool:
     c=get_conn().cursor(); c.execute("SELECT 1 FROM users WHERE nickname=?", (nick,)); r=c.fetchone(); c.connection.close(); return bool(r)
 
@@ -180,14 +199,17 @@ def create_user(email:str, name:str, nickname:str, pw:str):
 
 def get_user_by_email(email:str):
     c=get_conn().cursor(); c.execute("SELECT * FROM users WHERE email=?", (email,)); r=c.fetchone(); c.connection.close(); return r
+
 def get_user_by_login(login:str):
     conn=get_conn(); cur=conn.cursor()
     cur.execute("SELECT * FROM users WHERE email=?", (login,)); row=cur.fetchone()
     if not row:
         cur.execute("SELECT * FROM users WHERE nickname=?", (login,)); row=cur.fetchone()
     conn.close(); return row
+
 def get_user(user_id:int):
     c=get_conn().cursor(); c.execute("SELECT * FROM users WHERE id=?", (user_id,)); r=c.fetchone(); c.connection.close(); return r
+
 def update_password(user_id:int, new_pw:str):
     conn=get_conn(); cur=conn.cursor()
     cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(new_pw), user_id))
@@ -210,8 +232,11 @@ def verify_reset_token(token:str):
     if row["used"]: return None, "used"
     if dt.datetime.fromisoformat(row["expires_at"]) < dt.datetime.utcnow(): return None, "expired"
     return row, "ok"
+
 def consume_reset_token(token:str):
-    conn=get_conn(); cur=conn.cursor(); cur.execute("UPDATE reset_tokens SET used=1 WHERE token=?", (token,)); conn.commit(); conn.close()
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute("UPDATE reset_tokens SET used=1 WHERE token=?", (token,))
+    conn.commit(); conn.close()
 
 # ---- Rooms / Members ----
 def gen_room_id(n=6):
@@ -241,7 +266,7 @@ def update_room(owner_id:int, room_id:str, **fields):
     vals += [owner_id, room_id]
     conn=get_conn(); cur=conn.cursor()
     cur.execute(f"UPDATE rooms SET {', '.join(keys)} WHERE owner_id=? AND id=?", vals)
-    conn.commit(); ok = cur.rowcount>0; conn.close(); return ok
+    conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
 def delete_room(room_id:str, owner_id:int):
     conn=get_conn(); cur=conn.cursor()
@@ -253,7 +278,6 @@ def delete_room(room_id:str, owner_id:int):
         cur.execute("DELETE FROM expenses WHERE room_id=?", (room_id,))
         cur.execute("DELETE FROM announcements WHERE room_id=?", (room_id,))
         cur.execute("DELETE FROM polls WHERE room_id=?", (room_id,))
-        # poll_options/votes는 ON DELETE CASCADE가 없으므로 수동 정리
         cur.execute("DELETE FROM poll_options WHERE poll_id NOT IN (SELECT id FROM polls)")
         cur.execute("DELETE FROM poll_votes WHERE poll_id NOT IN (SELECT id FROM polls)")
     conn.commit(); conn.close(); return True
@@ -344,7 +368,7 @@ def day_aggregate(room_id:str):
     return room, days, agg, w
 
 def availability_names_by_day(room_id:str):
-    """{day:{status:[names...]}} with nickname/name."""
+    """{day:{status:[names...]}}"""
     conn=get_conn(); cur=conn.cursor()
     cur.execute("""SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS name
                    FROM availability a JOIN users u ON u.id=a.user_id
@@ -354,28 +378,29 @@ def availability_names_by_day(room_id:str):
     for r in rows:
         d=r["day"]; s=r["status"]; n=r["name"]
         out.setdefault(d, {}).setdefault(s, []).append(n)
-    # sort names
     for d in out:
         for s in out[d]:
             out[d][s]=sorted(out[d][s], key=lambda x:x.lower())
     return out
 
-# 최종 선택 기간
+# 최종 확정 기간
 def set_final_window(room_id:str, owner_id:int, start:str, end:str)->bool:
     conn=get_conn(); cur=conn.cursor()
     cur.execute("UPDATE rooms SET final_start=?, final_end=? WHERE id=? AND owner_id=?",
                 (start, end, room_id, owner_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
+
 def get_final_window(room_id:str):
     c=get_conn().cursor(); c.execute("SELECT final_start, final_end FROM rooms WHERE id=?", (room_id,))
-    r=c.fetchone(); c.connection.close(); 
+    r=c.fetchone(); c.connection.close()
     if not r or not r["final_start"] or not r["final_end"]: return None
     return (r["final_start"], r["final_end"])
 
 # ---------- Itinerary ----------
 def list_items(room_id:str, day:str):
-    c=get_conn().cursor(); c.execute("""SELECT * FROM itinerary_items
-                   WHERE room_id=? AND day=? ORDER BY position ASC""",(room_id,day))
+    c=get_conn().cursor()
+    c.execute("""SELECT * FROM itinerary_items
+                 WHERE room_id=? AND day=? ORDER BY position ASC""",(room_id,day))
     rows=c.fetchall(); c.connection.close(); return rows
 
 def add_item(room_id:str, day:str, name:str, category:str,
