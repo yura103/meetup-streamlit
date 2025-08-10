@@ -57,7 +57,7 @@ def init_db():
     );
     """)
     conn.commit()
-        # --- itinerary (계획/동선) ---
+    # --- itinerary (계획/동선) ---
     cur.executescript("""
     CREATE TABLE IF NOT EXISTS itinerary_items(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +96,6 @@ def init_db():
     );
     """)
     conn.commit()
-
 
     # nickname 안전 추가
     cur.execute("PRAGMA table_info(users)")
@@ -339,6 +338,34 @@ def day_aggregate(room_id:str):
         a["score"] = a["full"]*w["full"] + a["am"]*w["am"] + a["pm"]*w["pm"] + a["eve"]*w["eve"]
 
     return room, days, agg, w
+
+def availability_names_by_day(room_id: str):
+    """
+    날짜별로 상태(off/eve/pm/am/full) → 닉네임(or 이름) 목록
+    return: { 'YYYY-MM-DD': {'full':[...],'am':[...],'pm':[...],'eve':[...],'off':[...]} }
+    """
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS nick
+        FROM availability a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.room_id = ?
+    """, (room_id,))
+    rows = cur.fetchall(); conn.close()
+
+    out = {}
+    for r in rows:
+        d = r["day"]; s = r["status"]; n = r["nick"]
+        if d not in out:
+            out[d] = {k: [] for k in ("full","am","pm","eve","off")}
+        if s in out[d]:
+            out[d][s].append(n)
+
+    # 보기 좋게 정렬
+    for d in out:
+        for k in out[d]:
+            out[d][k] = sorted(out[d][k])
+    return out
 
 # ---------- Itinerary CRUD ----------
 def list_items(room_id:str, day:str):

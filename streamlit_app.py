@@ -293,21 +293,71 @@ def room_page():
 
         st.markdown("---")
         st.subheader("집계 및 추천")
+
+        # ---- 이름 포함 집계 ----
         room_row, days_list, agg, weights = DB.day_aggregate(rid)
+        names_by_day = DB.availability_names_by_day(rid)   # ★ 추가
+
         df_agg = pd.DataFrame([
-            {"date": d, "full": agg[d]["full"], "am": agg[d]["am"], "pm": agg[d]["pm"], "eve": agg[d]["eve"],
-             "score": round(agg[d]["score"],2),
-             "quorum_ok": "✅" if (agg[d]["full"]+agg[d]["am"]+agg[d]["pm"]+agg[d]["eve"])>=room_row["quorum"] else "❌"}
+            {
+                "date": d,
+                "full": agg[d]["full"], "am": agg[d]["am"], "pm": agg[d]["pm"], "eve": agg[d]["eve"],
+                "score": round(agg[d]["score"],2),
+                "quorum_ok": "✅" if (agg[d]["full"]+agg[d]["am"]+agg[d]["pm"]+agg[d]["eve"])>=room_row["quorum"] else "❌",
+                "FULL(이름)": ", ".join(names_by_day.get(d, {}).get("full", [])),
+                "AM(이름)":   ", ".join(names_by_day.get(d, {}).get("am", [])),
+                "PM(이름)":   ", ".join(names_by_day.get(d, {}).get("pm", [])),
+                "EVE(이름)":  ", ".join(names_by_day.get(d, {}).get("eve", [])),
+            }
             for d in days_list
         ])
         st.dataframe(df_agg, use_container_width=True, hide_index=True)
 
+        # 날짜 하나 골라서 뱃지로 보기
+        def chip(txt):
+            return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:4px;display:inline-block">{txt}</span>'
+
+        st.markdown("#### 날짜별 가능 멤버(뱃지)")
+        pick_for_names = st.selectbox("날짜 선택", days_list, index=0, key="names_day_pick")
+        nb = names_by_day.get(pick_for_names, {})
+        for label, key in [("하루종일", "full"), ("7시간", "am"), ("5시간", "pm"), ("3시간/모름", "eve")]:
+            chips = " ".join(chip(n) for n in nb.get(key, [])) or "(없음)"
+            st.markdown(f"**{label}** · {chips}", unsafe_allow_html=True)
+
+        # ---- TopK 연속 구간 + 구간 전체 가능 인원 ----
         topk = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
         if topk:
             st.markdown("### ⭐ 추천 Top-3 연속 구간")
             for i,win in enumerate(topk, 1):
                 feas = "충족" if win["feasible"] else "⚠️ 최소 인원 미충족 포함"
                 st.write(f"**#{i} | {win['days'][0]} ~ {win['days'][-1]} | 점수 {win['score']:.2f} | {feas}**")
+
+                days_in_win = win["days"]
+                sets_per_day = []
+                for d in days_in_win:
+                    nb2 = names_by_day.get(d, {})
+                    eligible = set(nb2.get("full", [])) | set(nb2.get("am", [])) | set(nb2.get("pm", [])) | set(nb2.get("eve", []))
+                    sets_per_day.append(eligible)
+                always_ok = set.intersection(*sets_per_day) if sets_per_day else set()
+
+                def level_rank(s):  # 높은 가중치가 높은 레벨
+                    return {"off":0, "eve":1, "pm":2, "am":3, "full":4}.get(s,0)
+
+                # 사람별로 구간 내 "최저 보장 상태" 계산
+                lowest_status = {}
+                for d in days_in_win:
+                    nb3 = names_by_day.get(d, {})
+                    for s in ("full","am","pm","eve"):
+                        for name in nb3.get(s, []):
+                            cur = lowest_status.get(name, "full")
+                            lowest_status[name] = min(cur, s, key=lambda x: level_rank(x))
+
+                chips = []
+                for name in sorted(always_ok):
+                    tag = lowest_status.get(name, "eve")
+                    label = {"full":"하루종일", "am":"7시간", "pm":"5시간", "eve":"3시간/모름"}.get(tag, tag)
+                    chips.append(chip(f"{name} · {label}"))
+                st.markdown("가능 멤버(구간 전체): " + (" ".join(chips) or "(없음)"), unsafe_allow_html=True)
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):
@@ -349,7 +399,7 @@ def room_page():
             table = []
             for r in rows:
                 table.append({
-                    "id": r["id"], "position": r["position"], "번호": 0,  # 번호는 아래에서 덮어씀
+                    "id": r["id"], "position": r["position"], "번호": 0,
                     "start_time": r["start_time"] or "", "end_time": r["end_time"] or "",
                     "category": r["category"], "name": r["name"],
                     "budget": float(r["budget"] or 0)
@@ -397,9 +447,7 @@ def room_page():
                 with d3:
                     del_id = st.number_input("삭제할 ID", min_value=0, step=1, value=0, key="plan_del_id")
                     if st.button("선택 ID 삭제", key="plan_del_btn") and del_id>0:
-                        # 1) 삭제
                         DB.delete_item(int(del_id), rid)
-                        # 2) 남은 항목 position 연속 재정렬 후 저장
                         rest = DB.list_items(rid, pick_day)
                         rest_sorted = sorted(rest, key=lambda x: x["position"])
                         repacked = []
