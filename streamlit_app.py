@@ -566,7 +566,7 @@ def room_page():
                 items_sorted = sorted(items, key=lambda r:r["position"])
                 coords=[]
                 for i,it in enumerate(items_sorted, start=1):
-                    if it["lat"] and it["lon"]):
+                    if it["lat"] and it["lon"]:
                         coords.append((it["lat"], it["lon"]))
                         popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
                         folium.Marker(
