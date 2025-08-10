@@ -3,6 +3,11 @@ import database as DB
 import auth as AUTH
 from planner_core import best_windows
 from email_utils import send_reset_email
+from streamlit_folium import st_folium
+import folium
+from geopy.geocoders import Nominatim
+from planner_core import optimize_route
+
 
 st.set_page_config(page_title="친구 약속 잡기", layout="wide")
 DB.init_db()
@@ -292,6 +297,153 @@ def room_page():
 
     if DB.all_submitted(rid):
         st.success("모든 인원이 제출 완료! 위 추천 구간을 참고해 최종 확정하세요 ✅")
+
+        # ---------------- 계획 & 동선 / 예산 ----------------
+    st.markdown("---")
+    tab_plan, = st.tabs(["🗺️ 계획 & 동선 / 예산"])
+
+    with tab_plan:
+        left, right = st.columns([1.1, 1.2])
+
+        # 날짜 선택
+        import pandas as _pd
+        days_options = _pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
+        pick_day = st.selectbox("날짜 선택", days_options, index=0)
+
+        # ---------- 좌측: 계획표 + 검색/추가 ----------
+        with left:
+            st.subheader("계획표 (순서·시간·카테고리·장소·예산)")
+            with st.expander("📍 장소 검색해서 추가"):
+                q = st.text_input("장소/주소 검색")
+                colg1, colg2, colg3 = st.columns([2,1,1])
+                with colg1: cat = st.selectbox("카테고리", ["식사","숙소","놀기","카페","쇼핑","기타"])
+                with colg2: bud = st.number_input("예산(원)", 0, step=1000, value=0)
+                with colg3: is_anchor = st.checkbox("숙소/고정", value=False)
+                if st.button("검색 & 추가"):
+                    if not q.strip():
+                        st.error("검색어를 입력하세요.")
+                    else:
+                        try:
+                            geoloc = Nominatim(user_agent="youchin").geocode(q)
+                            lat, lon = (geoloc.latitude, geoloc.longitude) if geoloc else (None, None)
+                        except Exception:
+                            lat, lon = (None, None)
+                        DB.add_item(rid, pick_day, q.strip(), cat, lat, lon, bud, None, None, is_anchor, None, st.session_state["user_id"])
+                        st.success("추가됨"); _rerun()
+
+            rows = DB.list_items(rid, pick_day)
+            table = []
+            for r in rows:
+                table.append({
+                    "id": r["id"], "position": r["position"], "start_time": r["start_time"] or "",
+                    "end_time": r["end_time"] or "", "category": r["category"], "name": r["name"],
+                    "budget": float(r["budget"] or 0)
+                })
+            df_plan = pd.DataFrame(table)
+
+            if df_plan.empty:
+                st.info("이 날짜의 계획이 없습니다. 위에서 장소를 검색/추가하세요.")
+            else:
+                df_plan = df_plan.sort_values("position").reset_index(drop=True)
+                edited = st.data_editor(
+                    df_plan,
+                    column_config={
+                        "id": st.column_config.TextColumn("ID", disabled=True),
+                        "position": st.column_config.NumberColumn("순서", min_value=1, step=1),
+                        "start_time": st.column_config.TextColumn("시작", help="예: 10:00"),
+                        "end_time": st.column_config.TextColumn("종료", help="예: 12:00"),
+                        "category": st.column_config.SelectboxColumn("카테고리", options=["식사","숙소","놀기","카페","쇼핑","기타"]),
+                        "name": st.column_config.TextColumn("장소"),
+                        "budget": st.column_config.NumberColumn("예산(원)", step=1000)
+                    },
+                    hide_index=True, use_container_width=True
+                )
+
+                cA,cB,cC = st.columns(3)
+                with cA:
+                    if st.button("저장(계획)"):
+                        DB.bulk_save_positions(rid, pick_day, edited.to_dict("records"))
+                        st.success("저장 완료"); _rerun()
+                with cB:
+                    if st.button("자동 동선 추천(순서 재배치)"):
+                        items_for_route = [{"id": r["id"], "lat": r["lat"], "lon": r["lon"], "is_anchor": r["is_anchor"]} for r in DB.list_items(rid, pick_day)]
+                        order_ids = optimize_route(items_for_route)
+                        new_rows=[]; p=1
+                        for oid in order_ids:
+                            row = next(rr for rr in edited.to_dict("records") if rr["id"]==oid)
+                            row["position"]=p; new_rows.append(row); p+=1
+                        DB.bulk_save_positions(rid, pick_day, new_rows)
+                        st.success("동선 정렬 완료!"); _rerun()
+                with cC:
+                    del_id = st.number_input("삭제할 ID", min_value=0, step=1, value=0)
+                    if st.button("선택 ID 삭제") and del_id>0:
+                        DB.delete_item(int(del_id), rid); st.success("삭제됨"); _rerun()
+
+            st.markdown("### 💳 지출 입력")
+            colx, coly, colz, colw = st.columns([1.2,1,1,1.2])
+            with colx:
+                place_n = st.text_input("장소(선택 입력)")
+            with coly:
+                payer = st.selectbox("결제자", options=[(m["id"], (m["nickname"] or m["name"])) for m in members],
+                                     format_func=lambda x: x[1])
+            with colz:
+                amt = st.number_input("금액(원)", 0, step=1000)
+            with colw:
+                memo = st.text_input("메모")
+            if st.button("지출 추가"):
+                DB.add_expense(rid, pick_day, place_n or "", payer[0], float(amt), memo or "")
+                st.success("지출 추가됨"); _rerun()
+
+            exps = DB.list_expenses(rid)
+            if exps:
+                st.dataframe(
+                    pd.DataFrame([{
+                        "id":e["id"], "날짜":e["day"], "장소":e["place"], "결제자": (e["payer_nick"] or e["payer_name"]),
+                        "금액": int(e["amount"]), "메모": e["memo"] or ""
+                    } for e in exps]),
+                    use_container_width=True, hide_index=True
+                )
+                delx = st.number_input("지출 삭제 ID", min_value=0, step=1, value=0)
+                if st.button("지출 삭제") and delx>0:
+                    DB.delete_expense(int(delx), rid); st.success("삭제됨"); _rerun()
+
+        # ---------- 우측: 지도 ----------
+        with right:
+            st.subheader("동선 지도")
+            items = DB.list_items(rid, pick_day)
+            if not items:
+                st.info("표에서 장소를 추가하면 지도에 표시됩니다.")
+            else:
+                lat0 = next((it["lat"] for it in items if it["lat"]), None) or 37.5665
+                lon0 = next((it["lon"] for it in items if it["lon"]), None) or 126.9780
+                m = folium.Map(location=[lat0, lon0], zoom_start=12, control_scale=True)
+                items_sorted = sorted(items, key=lambda r:r["position"])
+                coords=[]
+                for i,it in enumerate(items_sorted, start=1):
+                    if it["lat"] and it["lon"]:
+                        coords.append((it["lat"], it["lon"]))
+                        popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
+                        folium.Marker(
+                            [it["lat"], it["lon"]],
+                            popup=popup, tooltip=popup,
+                            icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")
+                        ).add_to(m)
+                if len(coords)>=2:
+                    folium.PolyLine(coords, weight=4, opacity=0.8).add_to(m)
+                st_folium(m, height=520, width=None)
+
+        # ---------- 정산 요약 ----------
+        st.markdown("---")
+        st.subheader("정산 요약")
+        transfers, total = DB.settle_transfers(rid)
+        st.caption(f"총 지출: **{int(total)}원** / 인당 {int(total/max(1,len(members)))}원")
+        if not transfers:
+            st.info("정산할 항목이 아직 없어요.")
+        else:
+            name_of = {m["id"]: (m["nickname"] or m["name"]) for m in members}
+            st.write("**이체 추천 목록 (최소 이체 수)**")
+            for t in transfers:
+                st.write(f"- {name_of[t['from']]} → {name_of[t['to']]} : **{int(t['amount'])}원**")
 
 def router():
     page = st.session_state.get("page", "auth")

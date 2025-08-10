@@ -57,6 +57,46 @@ def init_db():
     );
     """)
     conn.commit()
+        # --- itinerary (계획/동선) ---
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS itinerary_items(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      day TEXT NOT NULL,                 -- YYYY-MM-DD
+      position INTEGER NOT NULL,         -- 동선 순서 (1..n)
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,            -- 식사/숙소/놀기/기타...
+      lat REAL, lon REAL,
+      budget REAL NOT NULL DEFAULT 0,
+      start_time TEXT,                   -- "10:00" (선택)
+      end_time   TEXT,                   -- "12:30" (선택)
+      is_anchor INTEGER NOT NULL DEFAULT 0,  -- 숙소 등 고정점
+      notes TEXT,
+      created_by INTEGER,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(room_id) REFERENCES rooms(id),
+      FOREIGN KEY(created_by) REFERENCES users(id)
+    );
+    """)
+    conn.commit()
+
+    # --- expenses (지출/정산) ---
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS expenses(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      day TEXT,
+      place TEXT,                -- 선택: 장소명
+      payer_id INTEGER NOT NULL, -- 결제자
+      amount REAL NOT NULL,
+      memo TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(room_id) REFERENCES rooms(id),
+      FOREIGN KEY(payer_id) REFERENCES users(id)
+    );
+    """)
+    conn.commit()
+
 
     # nickname 안전 추가
     cur.execute("PRAGMA table_info(users)")
@@ -299,3 +339,95 @@ def day_aggregate(room_id:str):
         a["score"] = a["full"]*w["full"] + a["am"]*w["am"] + a["pm"]*w["pm"] + a["eve"]*w["eve"]
 
     return room, days, agg, w
+
+# ---------- Itinerary CRUD ----------
+def list_items(room_id:str, day:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT * FROM itinerary_items
+                   WHERE room_id=? AND day=? ORDER BY position ASC""",
+                (room_id, day))
+    rows = cur.fetchall(); conn.close(); return rows
+
+def add_item(room_id:str, day:str, name:str, category:str,
+             lat=None, lon=None, budget:float=0.0,
+             start_time:str=None, end_time:str=None,
+             is_anchor:bool=False, notes:str=None, created_by:int=None):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COALESCE(MAX(position),0)+1 FROM itinerary_items WHERE room_id=? AND day=?", (room_id, day))
+    pos = cur.fetchone()[0]
+    cur.execute("""INSERT INTO itinerary_items
+        (room_id, day, position, name, category, lat, lon, budget, start_time, end_time, is_anchor, notes, created_by, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (room_id, day, pos, name, category, lat, lon, budget, start_time, end_time, 1 if is_anchor else 0, notes, created_by, dt.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+
+def bulk_save_positions(room_id:str, day:str, items:list[dict]):
+    """items: [{'id':..,'position':..,'budget':..,'start_time':..,'end_time':..,'category':..,'name':..}]"""
+    conn = get_conn(); cur = conn.cursor()
+    for it in items:
+        cur.execute("""UPDATE itinerary_items
+            SET position=?, budget=?, start_time=?, end_time=?, category=?, name=?
+            WHERE id=? AND room_id=? AND day=?""",
+            (int(it["position"]), float(it.get("budget",0)), it.get("start_time"), it.get("end_time"),
+             it.get("category","기타"), it.get("name"), int(it["id"]), room_id, day))
+    conn.commit(); conn.close()
+
+def delete_item(item_id:int, room_id:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM itinerary_items WHERE id=? AND room_id=?", (item_id, room_id))
+    conn.commit(); conn.close()
+
+# ---------- Expenses ----------
+def add_expense(room_id:str, day:str, place:str, payer_id:int, amount:float, memo:str=None):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""INSERT INTO expenses(room_id,day,place,payer_id,amount,memo,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (room_id, day, place, payer_id, amount, memo, dt.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+
+def list_expenses(room_id:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""SELECT e.*, u.name AS payer_name, u.nickname AS payer_nick
+                   FROM expenses e JOIN users u ON u.id=e.payer_id
+                   WHERE e.room_id=? ORDER BY e.created_at DESC""", (room_id,))
+    rows = cur.fetchall(); conn.close(); return rows
+
+def delete_expense(expense_id:int, room_id:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM expenses WHERE id=? AND room_id=?", (expense_id, room_id))
+    conn.commit(); conn.close()
+
+def settle_transfers(room_id:str):
+    """최소 이체 횟수 정산(균등 분배). 결과: [{'from':..,'to':..,'amount':..}]"""
+    exps = list_expenses(room_id)
+    if not exps: return [], 0.0
+    # 멤버
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT u.id,u.name,u.nickname FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=?", (room_id,))
+    members = cur.fetchall(); conn.close()
+    ids = [m["id"] for m in members]
+    n = len(ids)
+    total = sum(e["amount"] for e in exps)
+    share = total / max(n,1)
+
+    bal = {uid: -share for uid in ids}  # 각자 내야 할 금액(음수)
+    for e in exps:
+        bal[e["payer_id"]] += e["amount"]
+
+    debtors  = [[uid, -amt] for uid,amt in bal.items() if amt < -1e-9]
+    creditors= [[uid,  amt] for uid,amt in bal.items() if amt >  1e-9]
+    debtors.sort(key=lambda x:x[1], reverse=True)
+    creditors.sort(key=lambda x:x[1], reverse=True)
+
+    transfers=[]
+    i=j=0
+    while i<len(debtors) and j<len(creditors):
+        duid, d = debtors[i]; cuid, c = creditors[j]
+        x = min(d,c)
+        transfers.append({"from":duid, "to":cuid, "amount":round(x,0)})
+        d -= x; c -= x
+        if d<=1e-9: i+=1
+        else: debtors[i][1]=d
+        if c<=1e-9: j+=1
+        else: creditors[j][1]=c
+    return transfers, total
