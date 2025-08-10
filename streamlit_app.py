@@ -324,40 +324,88 @@ def room_page():
             chips = " ".join(chip(n) for n in nb.get(key, [])) or "(없음)"
             st.markdown(f"**{label}** · {chips}", unsafe_allow_html=True)
 
-        # ---- TopK 연속 구간 + 구간 전체 가능 인원 ----
+        # ---- TopK 연속 구간 + (신규) 겹치는 동일 점수 구간 묶기 ----
         topk = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
+
+        def _overlap(days_a, days_b):
+            return bool(set(days_a) & set(days_b))
+
+        def group_overlapping_windows(wins, tol=1e-6):
+            groups = []
+            for w in wins:
+                placed = False
+                for g in groups:
+                    rep = g["rep"]
+                    if abs(w["score"] - rep["score"]) < tol and _overlap(w["days"], rep["days"]):
+                        g["variants"].append(w)
+                        # 대표 선정: feasible 우선, 같으면 시작일 빠른 것
+                        cand = rep
+                        if (w["feasible"] and not rep["feasible"]) or \
+                           (w["feasible"] == rep["feasible"] and w["days"][0] < rep["days"][0]):
+                            cand = w
+                        g["rep"] = cand
+                        placed = True
+                        break
+                if not placed:
+                    groups.append({"rep": w, "variants": [w]})
+            # 대표 기준 정렬
+            groups.sort(key=lambda g: (g["rep"]["days"][0], -g["rep"]["score"]))
+            return groups
+
+        collapse_same = st.toggle(
+            "겹치는 동일 점수 구간 묶어서 보기",
+            value=True,
+            help="동일 점수이며 서로 겹치는 구간을 대표 1개 + 대안 목록으로 묶어 보여줘요."
+        )
+
+        def level_rank(s):
+            return {"off":0, "eve":1, "pm":2, "am":3, "full":4}.get(s,0)
+
+        def render_win(win):
+            feas = "충족" if win["feasible"] else "⚠️ 최소 인원 미충족 포함"
+            st.write(f"**{win['days'][0]} ~ {win['days'][-1]} | 점수 {win['score']:.2f} | {feas}**")
+            # 구간 전체 가능 멤버 뱃지
+            days_in_win = win["days"]
+            sets_per_day = []
+            for d in days_in_win:
+                nb2 = names_by_day.get(d, {})
+                eligible = set(nb2.get("full", [])) | set(nb2.get("am", [])) | set(nb2.get("pm", [])) | set(nb2.get("eve", []))
+                sets_per_day.append(eligible)
+            always_ok = set.intersection(*sets_per_day) if sets_per_day else set()
+
+            lowest_status = {}
+            for d in days_in_win:
+                nb3 = names_by_day.get(d, {})
+                for s in ("full","am","pm","eve"):
+                    for name in nb3.get(s, []):
+                        cur = lowest_status.get(name, "full")
+                        lowest_status[name] = min(cur, s, key=lambda x: level_rank(x))
+
+            chips = []
+            for name in sorted(always_ok):
+                tag = lowest_status.get(name, "eve")
+                label = {"full":"하루종일", "am":"7시간", "pm":"5시간", "eve":"3시간/모름"}.get(tag, tag)
+                chips.append(chip(f"{name} · {label}"))
+            st.markdown("가능 멤버(구간 전체): " + (" ".join(chips) or "(없음)"), unsafe_allow_html=True)
+
         if topk:
-            st.markdown("### ⭐ 추천 Top-3 연속 구간")
-            for i,win in enumerate(topk, 1):
-                feas = "충족" if win["feasible"] else "⚠️ 최소 인원 미충족 포함"
-                st.write(f"**#{i} | {win['days'][0]} ~ {win['days'][-1]} | 점수 {win['score']:.2f} | {feas}**")
-
-                days_in_win = win["days"]
-                sets_per_day = []
-                for d in days_in_win:
-                    nb2 = names_by_day.get(d, {})
-                    eligible = set(nb2.get("full", [])) | set(nb2.get("am", [])) | set(nb2.get("pm", [])) | set(nb2.get("eve", []))
-                    sets_per_day.append(eligible)
-                always_ok = set.intersection(*sets_per_day) if sets_per_day else set()
-
-                def level_rank(s):  # 높은 가중치가 높은 레벨
-                    return {"off":0, "eve":1, "pm":2, "am":3, "full":4}.get(s,0)
-
-                # 사람별로 구간 내 "최저 보장 상태" 계산
-                lowest_status = {}
-                for d in days_in_win:
-                    nb3 = names_by_day.get(d, {})
-                    for s in ("full","am","pm","eve"):
-                        for name in nb3.get(s, []):
-                            cur = lowest_status.get(name, "full")
-                            lowest_status[name] = min(cur, s, key=lambda x: level_rank(x))
-
-                chips = []
-                for name in sorted(always_ok):
-                    tag = lowest_status.get(name, "eve")
-                    label = {"full":"하루종일", "am":"7시간", "pm":"5시간", "eve":"3시간/모름"}.get(tag, tag)
-                    chips.append(chip(f"{name} · {label}"))
-                st.markdown("가능 멤버(구간 전체): " + (" ".join(chips) or "(없음)"), unsafe_allow_html=True)
+            if collapse_same:
+                groups = group_overlapping_windows(topk)
+                st.markdown("### ⭐ 추천 구간 (겹치는 동일 점수는 묶어서)")
+                for i, g in enumerate(groups[:3], 1):
+                    st.write(f"**#{i} 대표 구간**")
+                    render_win(g["rep"])
+                    if len(g["variants"]) > 1:
+                        with st.expander("같은 점수의 대안 구간 보기"):
+                            for v in g["variants"]:
+                                if v is g["rep"]:
+                                    continue
+                                st.caption(f"- {v['days'][0]} ~ {v['days'][-1]}  ·  {'충족' if v['feasible'] else '⚠️'}")
+            else:
+                st.markdown("### ⭐ 추천 Top-3 연속 구간")
+                for i, win in enumerate(topk[:3], 1):
+                    st.write(f"**#{i}**")
+                    render_win(win)
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):
@@ -521,7 +569,7 @@ def room_page():
                 )
                 delx = st.number_input("지출 삭제 ID", min_value=0, step=1, value=0, key="exp_del_id")
                 if st.button("지출 삭제", key="exp_del_btn") and delx>0:
-                    DB.delete_expense(int(delx), rid); st.success("삭제됨"); _rerun()
+                    DB.delete_expense(int(delx), rid); st.success("삭제됨"); _rerrun()
             else:
                 st.info("지출 내역이 없습니다.")
 
