@@ -26,8 +26,8 @@ def init_db():
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       owner_id INTEGER NOT NULL,
-      start TEXT NOT NULL,
-      end   TEXT NOT NULL,
+      start TEXT NOT NULL,  -- YYYY-MM-DD
+      end   TEXT NOT NULL,  -- YYYY-MM-DD
       min_days INTEGER NOT NULL,
       quorum   INTEGER NOT NULL,
       w_full REAL NOT NULL DEFAULT 1.0,
@@ -60,7 +60,7 @@ def init_db():
     """)
     conn.commit()
 
-    # ---- users.nickname 컬럼이 없으면 추가 ----
+    # nickname 컬럼 안전 추가
     cur.execute("PRAGMA table_info(users)")
     cols = [r[1] for r in cur.fetchall()]
     if "nickname" not in cols:
@@ -68,15 +68,27 @@ def init_db():
         conn.commit()
         cur.execute("UPDATE users SET nickname = name WHERE nickname IS NULL OR nickname = ''")
         conn.commit()
-    # UNIQUE 인덱스(재실행 안전)
     cur.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_nickname_uq "
         "ON users(nickname) WHERE nickname IS NOT NULL"
     )
     conn.commit()
+
+    # reset tokens
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS reset_tokens(
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+    conn.commit()
     conn.close()
 
-# ---------- Auth ----------
+# ---------- Auth primitives ----------
 def hash_pw(pw:str)->bytes:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 
@@ -84,7 +96,19 @@ def check_pw(pw:str, pw_hash:bytes)->bool:
     try: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
     except Exception: return False
 
+def email_exists(email:str)->bool:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE email=?", (email,))
+    row = cur.fetchone(); conn.close(); return bool(row)
+
+def nickname_exists(nick:str)->bool:
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM users WHERE nickname=?", (nick,))
+    row = cur.fetchone(); conn.close(); return bool(row)
+
 def create_user(email:str, name:str, nickname:str, pw:str):
+    if email_exists(email): raise ValueError("email_taken")
+    if nickname and nickname_exists(nickname): raise ValueError("nickname_taken")
     conn = get_conn(); cur = conn.cursor()
     cur.execute("INSERT INTO users(email,name,nickname,pw_hash,created_at) VALUES(?,?,?,?,?)",
                 (email, name, nickname, hash_pw(pw), dt.datetime.utcnow().isoformat()))
@@ -96,7 +120,7 @@ def get_user_by_email(email:str):
     row = cur.fetchone(); conn.close(); return row
 
 def get_user_by_login(login:str):
-    """이메일 또는 닉네임으로 조회"""
+    # 이메일 또는 닉네임
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE email=?", (login,))
     row = cur.fetchone()
@@ -109,6 +133,38 @@ def get_user(user_id:int):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
     row = cur.fetchone(); conn.close(); return row
+
+def update_password(user_id:int, new_pw:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(new_pw), user_id))
+    conn.commit(); conn.close()
+
+# reset token APIs
+def create_reset_token(email:str, ttl_minutes:int=30):
+    user = get_user_by_email(email)
+    if not user: return None, "no_user"
+    token = secrets.token_urlsafe(32)
+    expires = (dt.datetime.utcnow() + dt.timedelta(minutes=ttl_minutes)).isoformat()
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO reset_tokens(token,user_id,expires_at,used,created_at) VALUES(?,?,?,?,?)",
+                (token, user["id"], expires, 0, dt.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    return token, "ok"
+
+def verify_reset_token(token:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM reset_tokens WHERE token=?", (token,))
+    row = cur.fetchone(); conn.close()
+    if not row: return None, "not_found"
+    if row["used"]: return None, "used"
+    if dt.datetime.fromisoformat(row["expires_at"]) < dt.datetime.utcnow():
+        return None, "expired"
+    return row, "ok"
+
+def consume_reset_token(token:str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE reset_tokens SET used=1 WHERE token=?", (token,))
+    conn.commit(); conn.close()
 
 # ---------- Rooms / Memberships ----------
 def gen_room_id(n=6):

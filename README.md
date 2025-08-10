@@ -1,59 +1,31 @@
 <h1 align="center">📅 YOUCHIN MeetUp Scheduler</h1>
 <p align="center">
-  <b>친구들과 일정 맞추기, 제출 현황 실시간 확인, 회원가입/로그인 지원</b><br>
-  <i>Streamlit 기반 간편 일정 관리 웹앱</i>
+  <b>친구들이랑 약속 날짜 쉽게! 제출 현황 실시간! 호스트 관리까지!</b><br>
+  <i>Streamlit 기반 가벼운 일정 조율 웹앱</i>
 </p>
 
 <p align="center">
-  <a href="https://meetup-app-nw8zmjuzw7sc88fh9sduxs.streamlit.app/">
-    <img src="https://img.shields.io/badge/🚀%20Streamlit%20App-Go%20Now-blueviolet?style=for-the-badge">
+  <a href="https://meetup-app-nw8zmjuzw7sc88fh9sduxs.streamlit.app">
+    <img src="https://img.shields.io/badge/🚀%20Open%20the%20App-Streamlit-blueviolet?style=for-the-badge">
   </a>
-  <a href="https://github.com/yura103/meetup-streamlit">
-    <img src="https://img.shields.io/github/stars/yura103/meetup-streamlit?style=for-the-badge&color=yellow">
-  </a>
-  <img src="https://img.shields.io/github/license/yura103/meetup-streamlit?style=for-the-badge&color=orange">
 </p>
 
 ---
 
-## ✨ 주요 기능
-- **회원가입 / 로그인**
-  - 이메일 + 닉네임 기반 계정 생성
-  - 로그인 시 본인 방/초대받은 방 목록 확인
-- **방 생성 / 참여**
-  - 시작일, 종료일, 최소 연속일수, 최소 인원 설정
-  - 초대 코드로 간편 참여
-- **제출 현황 실시간 확인**
-  - 방장이 전체 현황 열람 가능
-  - 각 멤버 제출/수정/삭제 가능
-  - 색상 안내:
-    - 🖤 불가 (OFF)
-    - 💚 일부 가능 (AM: 0.3 / PM: 0.1 / Night: 0.5)
-    - 💜 하루 종일 가능 (FULL)
-- **관리자 권한**
-  - 멤버 삭제, 제출 삭제 가능
-  - 방 삭제 가능
+## ✨ 기능
+- **회원가입/로그인**: 이메일+닉네임, 중복 가입 방지
+- **비밀번호 찾기**: 이메일로 재설정 토큰 발송 (SMTP: Secrets 또는 .env)
+- **방 생성/참여**: 기간·최소 연속일수·쿼럼·가중치(AM=0.3, PM=0.1, EVE=0.5, FULL=1.0)
+- **제출 현황 실시간**: 호스트 멤버 관리(초대/삭제/설정 저장/방 삭제)
+- **추천 Top-3**: 연속 min_days 창에서 가중치 합산 + 쿼럼 충족 여부
 
----
+## 🛠 Tech
+- Streamlit, SQLite, pandas
+- Auth: bcrypt + 토큰 기반 비번 재설정
+- Email: SMTP (Streamlit Secrets / .env)
 
-## 🛠 기술 스택
-| 구분 | 기술 |
-|------|------|
-| Frontend & Backend | Streamlit |
-| Database | SQLite3 |
-| Deploy | Streamlit Cloud |
-| Version Control | GitHub |
-
----
-
-## 🚀 설치 및 실행
+## ⚙️ 로컬 실행
 ```bash
-# Clone Repository
-git clone https://github.com/yura103/meetup-streamlit.git
-cd meetup-streamlit
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run locally
+# (옵션) .env 작성: SMTP_SERVER/PORT/USER/PASSWORD
 streamlit run streamlit_app.py
