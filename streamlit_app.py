@@ -174,8 +174,19 @@ def room_page():
             with b2:
                 inv_email = st.text_input("초대 이메일", key="invite_email")
                 if st.button("초대하기"):
-                    ok,msg = DB.invite_user_by_email(rid, inv_email.strip())
-                    st.success(msg) if ok else st.error(msg); _rerun()
+                    email_str = (inv_email or "").strip()
+                    if not email_str:
+                        st.error("이메일을 입력하세요.")
+                    else:
+                        ok, message = DB.invite_user_by_email(rid, email_str)
+                        # 문자열 보장 + 안전한 분기
+                        text = str(message)
+                        if ok:
+                            st.success(text)
+                        else:
+                            st.error(text)
+                        _rerun()
+
             with b3:
                 if st.button("⚠️ 방 삭제", type="secondary"):
                     DB.delete_room(rid, room["owner_id"])
