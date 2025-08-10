@@ -5,7 +5,7 @@
 - 로그인(이메일 또는 닉네임)
 - 비밀번호 재설정 토큰 발급/검증
 """
-import db as DB
+import database as DB
 
 def register_user(email: str, name: str, nickname: str, password: str):
     if DB.email_exists(email):

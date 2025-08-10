@@ -1,6 +1,6 @@
 # streamlit_app.py
 import streamlit as st, pandas as pd, datetime as dt
-import db as DB
+import database as DB
 import auth as AUTH
 from planner_core import best_windows
 from email_utils import send_reset_email
