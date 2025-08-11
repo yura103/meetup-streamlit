@@ -1,4 +1,4 @@
-import sqlite3, os, bcrypt, secrets, string, datetime as dt
+import sqlite3, os, bcrypt, secrets, string, json, datetime as dt
 
 DB_PATH = os.environ.get("PLANNER_DB", "planner.sqlite")
 
@@ -9,8 +9,6 @@ def get_conn():
 
 def init_db():
     conn = get_conn(); cur = conn.cursor()
-
-    # 기본 테이블
     cur.executescript("""
     PRAGMA journal_mode=WAL;
 
@@ -36,7 +34,6 @@ def init_db():
       w_am   REAL NOT NULL DEFAULT 0.3,
       w_pm   REAL NOT NULL DEFAULT 0.1,
       w_eve  REAL NOT NULL DEFAULT 0.5,
-      -- 최신 코드에서 쓰는 최종 확정 기간(선택)
       final_start TEXT,
       final_end   TEXT,
       created_at TEXT NOT NULL,
@@ -57,52 +54,13 @@ def init_db():
       user_id INTEGER NOT NULL,
       room_id TEXT NOT NULL,
       day TEXT NOT NULL,
-      status TEXT NOT NULL, -- off/eve/pm/am/full
+      status TEXT NOT NULL,
       PRIMARY KEY(user_id, room_id, day),
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(room_id) REFERENCES rooms(id)
     );
-    """)
 
-    # 계획/동선
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS itinerary_items(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      room_id TEXT NOT NULL,
-      day TEXT NOT NULL,
-      position INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      lat REAL, lon REAL,
-      budget REAL NOT NULL DEFAULT 0,
-      start_time TEXT, end_time TEXT,
-      is_anchor INTEGER NOT NULL DEFAULT 0,
-      notes TEXT,
-      created_by INTEGER,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY(room_id) REFERENCES rooms(id),
-      FOREIGN KEY(created_by) REFERENCES users(id)
-    );
-    """)
-
-    # 지출/정산
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS expenses(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      room_id TEXT NOT NULL,
-      day TEXT,
-      place TEXT,
-      payer_id INTEGER NOT NULL,
-      amount REAL NOT NULL,
-      memo TEXT,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY(room_id) REFERENCES rooms(id),
-      FOREIGN KEY(payer_id) REFERENCES users(id)
-    );
-    """)
-
-    # 공지
-    cur.executescript("""
+    /* 공지, 투표 */
     CREATE TABLE IF NOT EXISTS announcements(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -114,10 +72,7 @@ def init_db():
       FOREIGN KEY(room_id) REFERENCES rooms(id),
       FOREIGN KEY(created_by) REFERENCES users(id)
     );
-    """)
 
-    # 투표
-    cur.executescript("""
     CREATE TABLE IF NOT EXISTS polls(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -145,33 +100,67 @@ def init_db():
       FOREIGN KEY(option_id) REFERENCES poll_options(id),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
-    """)
 
-    # 리셋 토큰
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS reset_tokens(
-      token TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0,
+    /* 일정/지출 */
+    CREATE TABLE IF NOT EXISTS itinerary_items(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      lat REAL, lon REAL,
+      budget REAL NOT NULL DEFAULT 0,
+      start_time TEXT, end_time TEXT,
+      is_anchor INTEGER NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_by INTEGER,
       created_at TEXT NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id)
+      FOREIGN KEY(room_id) REFERENCES rooms(id),
+      FOREIGN KEY(created_by) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS expenses(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      day TEXT,
+      place TEXT,
+      payer_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      memo TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(room_id) REFERENCES rooms(id),
+      FOREIGN KEY(payer_id) REFERENCES users(id)
+    );
+
+    /* 추첨/사다리 로그 저장 */
+    CREATE TABLE IF NOT EXISTS draw_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      kind TEXT NOT NULL,           -- 'raffle' | 'ladder'
+      seed TEXT,
+      payload TEXT NOT NULL,        -- JSON: 입력(참가자/보상/사다리 구조 등)
+      result  TEXT NOT NULL,        -- JSON: 결과 매핑
+      created_by INTEGER,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(room_id) REFERENCES rooms(id),
+      FOREIGN KEY(created_by) REFERENCES users(id)
     );
     """)
 
-    # ---- 마이그레이션(컬럼 추가 보정) ----
-    cur.execute("PRAGMA table_info(rooms)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "final_start" not in cols:
-        cur.execute("ALTER TABLE rooms ADD COLUMN final_start TEXT")
-    if "final_end" not in cols:
-        cur.execute("ALTER TABLE rooms ADD COLUMN final_end TEXT")
-
+    # 보정
     cur.execute("PRAGMA table_info(users)")
-    ucols = [r[1] for r in cur.fetchall()]
-    if "nickname" not in ucols:
+    cols = [r[1] for r in cur.fetchall()]
+    if "nickname" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN nickname TEXT")
         cur.execute("UPDATE users SET nickname = name WHERE nickname IS NULL OR nickname=''")
+
+    cur.execute("PRAGMA table_info(rooms)")
+    rcols = [r[1] for r in cur.fetchall()]
+    if "final_start" not in rcols:
+        cur.execute("ALTER TABLE rooms ADD COLUMN final_start TEXT")
+    if "final_end" not in rcols:
+        cur.execute("ALTER TABLE rooms ADD COLUMN final_end TEXT")
 
     conn.commit(); conn.close()
 
@@ -215,7 +204,7 @@ def update_password(user_id:int, new_pw:str):
     cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(new_pw), user_id))
     conn.commit(); conn.close()
 
-# reset token
+# reset tokens
 def create_reset_token(email:str, ttl_minutes:int=30):
     user = get_user_by_email(email)
     if not user: return None, "no_user"
@@ -280,6 +269,7 @@ def delete_room(room_id:str, owner_id:int):
         cur.execute("DELETE FROM polls WHERE room_id=?", (room_id,))
         cur.execute("DELETE FROM poll_options WHERE poll_id NOT IN (SELECT id FROM polls)")
         cur.execute("DELETE FROM poll_votes WHERE poll_id NOT IN (SELECT id FROM polls)")
+        cur.execute("DELETE FROM draw_logs WHERE room_id=?", (room_id,))
     conn.commit(); conn.close(); return True
 
 def list_my_rooms(user_id:int):
@@ -368,7 +358,6 @@ def day_aggregate(room_id:str):
     return room, days, agg, w
 
 def availability_names_by_day(room_id:str):
-    """{day:{status:[names...]}}"""
     conn=get_conn(); cur=conn.cursor()
     cur.execute("""SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS name
                    FROM availability a JOIN users u ON u.id=a.user_id
@@ -543,3 +532,20 @@ def tally_poll(poll_id:int):
     total=sum(counts.values())
     c.connection.close()
     return counts, total
+
+# ---------- Draw/Ladder logs ----------
+def save_draw(room_id:str, kind:str, seed:str|None, payload:dict, result:dict, created_by:int):
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute("""INSERT INTO draw_logs(room_id,kind,seed,payload,result,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (room_id, kind, seed, json.dumps(payload, ensure_ascii=False),
+                 json.dumps(result, ensure_ascii=False), created_by, dt.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+
+def list_draws(room_id:str, kind:str|None=None):
+    c=get_conn().cursor()
+    if kind:
+        c.execute("""SELECT * FROM draw_logs WHERE room_id=? AND kind=? ORDER BY created_at DESC""", (room_id, kind))
+    else:
+        c.execute("""SELECT * FROM draw_logs WHERE room_id=? ORDER BY created_at DESC""", (room_id,))
+    rows=c.fetchall(); c.connection.close(); return rows
