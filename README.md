@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://meetup-app-nw8zmjuzw7sc88fh9sduxs.streamlit.app">
+  <a href="https://meetup-app-youchin.streamlit.app/">
     <img src="https://img.shields.io/badge/🚀%20Open%20the%20App-Streamlit-blueviolet?style=for-the-badge">
   </a>
 </p>
