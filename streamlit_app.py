@@ -113,19 +113,13 @@ def render_availability_matrix(days_seq, names_by_day, title=None, note=None, ma
 
 # ===== 겹치거나 인접(하루 차이) 구간 병합 =====
 def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
-    """best_windows 결과를 받아 겹치거나 바로 붙는 날짜 구간을 하나로 합쳐서
-    days/score/feasible을 재계산한다."""
     if not raw_top:
         return []
-
-    # 1) interval로 변환
     intervals = []
     for w in raw_top:
         start_d = dt.date.fromisoformat(w["days"][0])
         end_d   = dt.date.fromisoformat(w["days"][-1])
         intervals.append({"start": start_d, "end": end_d, "days": set(w["days"])})
-
-    # 2) 시작일 기준 정렬 후 병합(겹치거나 하루 인접하면 합침)
     intervals.sort(key=lambda x: x["start"])
     merged = []
     cur = intervals[0]
@@ -134,11 +128,9 @@ def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
             cur["end"]  = max(cur["end"], nxt["end"])
             cur["days"] |= nxt["days"]
         else:
-            merged.append(cur)
-            cur = nxt
+            merged.append(cur); cur = nxt
     merged.append(cur)
 
-    # 3) 점수/충족 여부 재계산
     out = []
     for m in merged:
         days_sorted = sorted(list(m["days"]))
@@ -148,8 +140,6 @@ def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
             for d in days_sorted
         )
         out.append({"days": days_sorted, "score": score, "feasible": feasible})
-
-    # 점수 내림차순, 시작일 오름차순
     out.sort(key=lambda w: (-w["score"], w["days"][0]))
     return out
 
@@ -163,7 +153,7 @@ def login_ui():
         pw = st.text_input("비밀번호", type="password")
         if st.button("로그인"):
             user, msg = AUTH.login_user(login_id, pw)
-            if not user: st.error(str(msg))
+            if not user: st.error(msg)
             else:
                 st.session_state.update(
                     user_id=user["id"], user_name=user["name"],
@@ -181,7 +171,7 @@ def login_ui():
             if len(nickname.strip())<2: st.error("닉네임을 2자 이상 입력하세요."); st.stop()
             if len(pw2)<6: st.error("비밀번호는 6자 이상"); st.stop()
             ok,msg = AUTH.register_user(email2, name, nickname, pw2)
-            (st.success if ok else st.error)(str(msg))
+            st.success(msg) if ok else st.error(msg)
 
     with tabs[2]:
         fp_email = st.text_input("가입 이메일")
@@ -205,7 +195,7 @@ def login_ui():
             if status=="ok": st.success("변경되었습니다. 로그인하세요.")
             else:
                 msg = {"not_found":"토큰이 올바르지 않아요.","used":"이미 사용됨","expired":"만료됨"}.get(status,"토큰 오류")
-                st.error(str(msg))
+                st.error(msg)
 
 def logout():
     for k in ("user_id","user_name","user_email","user_nick","page","room_id"): st.session_state.pop(k, None)
@@ -227,7 +217,7 @@ def dashboard():
     else:
         for r in rows:
             col1,col2,col3,col4 = st.columns([3,3,2,2])
-            with col1: st.write(f"**{r['title']}**  ({r['id']})")
+            with col1: st.write(f"**{r['title']}**  (`{r['id']}`)")
             with col2: st.caption(f"{r['start']} ~ {r['end']} / 최소{r['min_days']}일 / 쿼럼{r['quorum']}")
             role = "👑 소유자" if r["role"]=="owner" else "👥 멤버"
             sub  = "✅ 제출" if r["submitted"] else "⏳ 미제출"
@@ -272,8 +262,6 @@ def room_page():
         _rerun(); return
 
     is_owner = (room["owner_id"] == st.session_state["user_id"])
-    is_admin = DB.is_site_admin(st.session_state["user_id"])
-    can_manage_room = (is_owner or is_admin)
 
     # 헤더 + 레전드
     st.header(f"방: {room['title']} ({rid})")
@@ -298,16 +286,16 @@ def room_page():
             for a in anns:
                 st.markdown(f"**{a['title']}**  · {a['created_at'][:16].replace('T',' ')}")
                 st.caption(a["body"])
-                if (is_owner or is_admin):
+                if is_owner:
                     c1,c2 = st.columns(2)
                     with c1:
                         if st.button(("고정 해제" if a["pinned"] else "고정"), key=f"pin_{a['id']}"):
-                            DB.toggle_pin_announcement(a["id"], rid, st.session_state["user_id"]); _rerun()
+                            DB.toggle_pin_announcement(a["id"], rid, room["owner_id"]); _rerun()
                     with c2:
                         if st.button("삭제", key=f"delann_{a['id']}"):
-                            DB.delete_announcement(a["id"], rid, st.session_state["user_id"]); _rerun()
+                            DB.delete_announcement(a["id"], rid, room["owner_id"]); _rerun()
                 st.markdown("---")
-        if (is_owner or is_admin):
+        if is_owner:
             st.caption("새 공지")
             ann_title = st.text_input("제목", key="ann_title_sb")
             ann_body  = st.text_area("내용", key="ann_body_sb")
@@ -346,10 +334,23 @@ def room_page():
                     c = counts.get(o["id"], 0); ratio = (c/total*100) if total else 0
                     st.progress(min(1.0, ratio/100.0), text=f"{o['text']} · {c}표 ({ratio:0.0f}%)")
                 st.markdown("---")
-        # (투표 생성은 방 멤버도 가능하게 둘 수 있지만, 요청이 없어서 유지)
+        if is_owner:
+            with st.expander("새 투표 만들기", expanded=False):
+                q = st.text_input("질문", key="newpoll_q")
+                raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
+                multi = st.checkbox("다중 선택", value=False, key="newpoll_multi")
+                closes = st.date_input("마감일(선택)", value=None, key="newpoll_date")
+                if st.button("투표 생성", key="newpoll_make"):
+                    options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
+                    closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
+                    if q.strip() and options:
+                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, st.session_state["user_id"])
+                        st.success("투표 생성!"); _rerun()
+                    else:
+                        st.error("질문과 보기 필요")
 
-    # ---- 방장/관리자 관리 ----
-    if can_manage_room:
+    # ---- 방장 관리 ----
+    if is_owner:
         with st.expander("👑 방 관리", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1: new_title = st.text_input("제목", room["title"])
@@ -369,7 +370,7 @@ def room_page():
             with b1:
                 if st.button("설정 저장", key="owner_save"):
                     DB.update_room(
-                        st.session_state["user_id"], rid,
+                        room["owner_id"], rid,
                         title=new_title, start=start.isoformat(), end=end.isoformat(),
                         min_days=int(min_days), quorum=int(quorum),
                         w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev
@@ -386,7 +387,7 @@ def room_page():
                         (st.success if ok else st.error)(str(msg)); _rerun()
             with b3:
                 if st.button("⚠️ 방 삭제", type="secondary", key="room_delete"):
-                    DB.delete_room(rid, st.session_state["user_id"])
+                    DB.delete_room(rid, room["owner_id"])
                     st.success("방 삭제 완료")
                     st.session_state["page"] = "dashboard"
                     st.session_state.pop("room_id", None)
@@ -423,7 +424,7 @@ def room_page():
         st.subheader("내 달력 입력")
         my_av = DB.get_my_availability(st.session_state["user_id"], rid)
 
-        # 범위 → DataFrame
+        # 범위 → 리스트
         days = []
         d0 = dt.date.fromisoformat(room["start"]); d1 = dt.date.fromisoformat(room["end"])
         cur = d0
@@ -431,7 +432,6 @@ def room_page():
             ds = cur.isoformat()
             days.append({"날짜": ds, "상태": my_av.get(ds, "off")})
             cur += dt.timedelta(days=1)
-        df = pd.DataFrame(days)
 
         label_map = {
             "off":  "불가(0.0)",
@@ -441,44 +441,78 @@ def room_page():
             "full": "하루종일(1.0)"
         }
         inv_label = {v:k for k,v in label_map.items()}
-        df["상태(선택)"] = [label_map.get(v, "불가(0.0)") for v in df["상태"]]
 
-        edited = st.data_editor(
-            df[["날짜","상태(선택)"]],
-            hide_index=True,
-            column_config={
-                "날짜": st.column_config.TextColumn(disabled=True),
-                "상태(선택)": st.column_config.SelectboxColumn(options=list(label_map.values()))
-            },
-            use_container_width=True,
-            key="time_editor"
-        )
-        edited["상태"] = [inv_label[x] for x in edited["상태(선택)"]]
-        payload = {row["날짜"]: row["상태"] for _, row in edited.iterrows()}
+        # ✅ 모바일/문제 환경 회피용 토글
+        simple_mode = st.toggle("모바일 호환 입력 모드(문제시 켜기)", value=False,
+                                help="일부 기기에서 표 편집기가 깨질 때 이 모드로 입력")
 
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            if st.button("저장", key="time_save"):
-                DB.upsert_availability(st.session_state["user_id"], rid, payload)
-                DB.set_submitted(st.session_state["user_id"], rid, False)
-                st.success("저장 완료(미제출)"); _rerun()
-        with c2:
-            if st.button("제출(Submit)", key="time_submit"):
-                DB.upsert_availability(st.session_state["user_id"], rid, payload)
-                DB.set_submitted(st.session_state["user_id"], rid, True)
-                st.success("제출 완료"); _rerun()
-        with c3:
-            if st.button("내 입력 삭제", key="time_clear"):
-                DB.clear_my_availability(st.session_state["user_id"], rid)
-                DB.set_submitted(st.session_state["user_id"], rid, False)
-                st.success("입력을 비웠습니다."); _rerun()
+        if simple_mode:
+            # 간단 폼 입력(React 오류 회피)
+            payload = {}
+            for row in days:
+                cur_state = label_map.get(row["상태"], "불가(0.0)")
+                sel = st.selectbox(
+                    row["날짜"],
+                    options=list(label_map.values()),
+                    index=list(label_map.values()).index(cur_state),
+                    key=f"simple_{row['날짜']}"
+                )
+                payload[row["날짜"]] = inv_label[sel]
 
-        st.markdown("#### 제출 현황")
-        submitted = [ (m["nickname"] or m["name"]) for m in members if m["submitted"]]
-        pending   = [ (m["nickname"] or m["name"]) for m in members if not m["submitted"]]
-        pill = lambda t: f'<span style="background:#eee;padding:4px 8px;border-radius:999px;margin-right:6px">{t}</span>'
-        st.markdown("**제출 완료:** " + (" ".join(pill(n) for n in submitted) or "없음"), unsafe_allow_html=True)
-        st.markdown("**제출 대기:** " + (" ".join(pill(n) for n in pending) or "없음"), unsafe_allow_html=True)
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                if st.button("저장", key="time_save_simple"):
+                    DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                    DB.set_submitted(st.session_state["user_id"], rid, False)
+                    st.success("저장 완료(미제출)"); _rerun()
+            with c2:
+                if st.button("제출(Submit)", key="time_submit_simple"):
+                    DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                    DB.set_submitted(st.session_state["user_id"], rid, True)
+                    st.success("제출 완료"); _rerun()
+            with c3:
+                if st.button("내 입력 삭제", key="time_clear_simple"):
+                    DB.clear_my_availability(st.session_state["user_id"], rid)
+                    DB.set_submitted(st.session_state["user_id"], rid, False)
+                    st.success("입력을 비웠습니다."); _rerun()
+
+        else:
+            # 기존 표 편집기 (PC/최신 브라우저 권장)
+            df = pd.DataFrame(days)
+            df["상태(선택)"] = [label_map.get(v, "불가(0.0)") for v in df["상태"]]
+            # 타입 강제(프론트 충돌 방지)
+            df["날짜"] = df["날짜"].astype(str)
+            df["상태(선택)"] = df["상태(선택)"].astype(str)
+
+            edited = st.data_editor(
+                df[["날짜","상태(선택)"]],
+                hide_index=True,
+                column_config={
+                    "날짜": st.column_config.TextColumn(disabled=True),
+                    "상태(선택)": st.column_config.SelectboxColumn(options=list(label_map.values()))
+                },
+                use_container_width=True,
+                key="time_editor"
+            )
+            edited["상태"] = [inv_label[x] for x in edited["상태(선택)"]]
+            payload = {row["날짜"]: row["상태"] for _, row in edited.iterrows()}
+
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                if st.button("저장", key="time_save"):
+                    DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                    DB.set_submitted(st.session_state["user_id"], rid, False)
+                    st.success("저장 완료(미제출)"); _rerun()
+            with c2:
+                if st.button("제출(Submit)", key="time_submit"):
+                    DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                    DB.set_submitted(st.session_state["user_id"], rid, True)
+                    st.success("제출 완료"); _rerun()
+            with c3:
+                if st.button("내 입력 삭제", key="time_clear"):
+                    DB.clear_my_availability(st.session_state["user_id"], rid)
+                    DB.set_submitted(st.session_state["user_id"], rid, False)
+                    st.success("입력을 비웠습니다."); _rerun()
 
         st.markdown("---")
         st.subheader("집계 및 추천")
@@ -515,7 +549,6 @@ def room_page():
         if raw_top:
             merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
             st.markdown("### ⭐ 추천 Top‑7 (겹치거나 붙는 구간은 하나로 합침)")
-
             def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
                 feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
                 if show_select_button:
@@ -524,7 +557,7 @@ def room_page():
                         st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
                     with colR:
                         if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
-                            DB.set_final_window(rid, st.session_state["user_id"], days_seq[0], days_seq[-1])
+                            DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
                             st.success("최종 일정으로 저장했습니다."); _rerun()
                 else:
                     st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
@@ -552,7 +585,7 @@ def room_page():
 
             for i, w in enumerate(merged_top[:7], 1):
                 st.write(f"**#{i}**")
-                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=can_manage_room)
+                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner)
                 render_availability_matrix(
                     w["days"], names_by_day,
                     title="사람×날짜 가능수준 (F/7/5/3/×)",
@@ -563,7 +596,6 @@ def room_page():
         if DB.all_submitted(rid):
             st.success("모든 인원이 제출 완료! 위 추천 구간을 참고해 최종 확정하세요 ✅")
 
-        # --- 전체 타임라인 (옵션) ---
         if st.toggle("사람별 타임라인(전체 기간) 보기", value=False):
             render_availability_matrix(
                 days_list, names_by_day,
