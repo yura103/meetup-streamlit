@@ -222,62 +222,71 @@ def _row_get(row, key, default=None):
         pass
     return default
 
-def render_expenses(room_id, members):
-    st.subheader("지출 입력")
-    days_options = pd.date_range(
-        st.session_state["room_start"], st.session_state["room_end"]
-    ).strftime("%Y-%m-%d").tolist()
-    exp_day = st.selectbox("날짜", days_options, key="exp_day")
-    x1,x2,x3,x4 = st.columns([1.2,1,1,1.2])
-    with x1: place_n = st.text_input("장소(선택 입력)", key="exp_place")
-    with x2: payer    = st.selectbox("결제자", options=[(m["id"], (m["nickname"] or m["name"])) for m in members],
-                                     format_func=lambda x: x[1], key="exp_payer")
-    with x3: amt      = st.number_input("금액(원)", 0, step=1000, key="exp_amt")
-    with x4: memo     = st.text_input("메모", key="exp_memo")
-    cat = st.selectbox("카테고리", ["식사","숙소","놀기","카페","쇼핑","교통","기타"], key="exp_cat")
-    if st.button("지출 추가", key="exp_add"):
-        DB.add_expense(room_id, exp_day, place_n or "", payer[0], float(amt), memo or "", category=cat)
-        st.success("지출 추가됨"); _rerun()
+# --- streamlit_app.py 안의 함수 교체 ---
+import matplotlib.pyplot as plt
 
-    st.markdown("### 지출 목록 / 통계")
-    exps = DB.list_expenses(room_id)
-    rows = [{
-        "id":       e["id"],
-        "day":      e["day"] or "",
-        "place":    e["place"] or "",
-        "category": _row_get(e, "category", "기타"),
-        "payer":    (e["payer_nick"] or e["payer_name"]),
-        "amount":   float(_row_get(e, "amount", 0) or 0),
-        "memo":     _row_get(e, "memo", "")
-    } for e in exps]
-    df_exp_raw = pd.DataFrame(rows, columns=["id","day","place","category","payer","amount","memo"])
-    if df_exp_raw.empty:
-        for c in ["day","place","category","payer","memo"]: df_exp_raw[c]=pd.Series(dtype="str")
-        df_exp_raw["amount"]=pd.Series(dtype="float")
-    df_exp_raw["amount"] = pd.to_numeric(df_exp_raw["amount"], errors="coerce").fillna(0)
+def render_expenses(rid, members):
+    st.subheader("지출 목록 / 통계")
 
+    exps = DB.list_expenses(rid)
+    if not exps:
+        st.info("지출 내역이 없습니다. 왼쪽에서 항목을 추가해 주세요.")
+        return
+
+    # 표 렌더링용 DataFrame
+    df = pd.DataFrame([{
+        "id": e["id"],
+        "day": e["day"],
+        "place": e.get("place") or "",
+        "payer": (e.get("payer_nick") or e.get("payer_name") or ""),
+        "category": e.get("category") or "기타",   # DB에 없으면 "기타"로 보정
+        "amount": e.get("amount", 0)
+    } for e in exps])
+
+    # 타입 보정
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["day"] = pd.to_datetime(df["day"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["category"] = df["category"].fillna("기타")
+
+    # 목록 표
     st.dataframe(
-        df_exp_raw.rename(columns={"day":"날짜","place":"장소","category":"카테고리","payer":"결제자","amount":"금액","memo":"메모"}),
+        df.rename(columns={"day":"날짜","place":"장소","payer":"결제자","category":"카테고리","amount":"금액(원)"}),
         hide_index=True, use_container_width=True
     )
 
-    by_day = (df_exp_raw.groupby("day", dropna=False)["amount"].sum()
-              .reset_index().sort_values("day"))
-    if not by_day.empty:
-        st.markdown("#### 날짜별 지출 합계")
-        st.dataframe(
-            by_day.rename(columns={"day":"날짜","amount":"합계(원)"}),
-            hide_index=True, use_container_width=True
-        )
+    # 날짜별 합계 막대그래프
+    df_day = df.groupby("day", as_index=False)["amount"].sum().sort_values("day")
+    if not df_day.empty and df_day["amount"].sum() > 0:
+        fig1, ax1 = plt.subplots()
+        ax1.bar(df_day["day"], df_day["amount"])
+        ax1.set_title("날짜별 지출 합계")
+        ax1.set_xlabel("날짜"); ax1.set_ylabel("금액(원)")
+        ax1.tick_params(axis="x", rotation=45)
+        fig1.tight_layout()
+        st.pyplot(fig1)
+        plt.close(fig1)
+    else:
+        st.info("날짜별 합계를 그릴 데이터가 아직 없습니다.")
 
-    by_cat = (df_exp_raw.groupby("category", dropna=False)["amount"].sum()
-              .reset_index().sort_values("amount", ascending=False))
-    if not by_cat.empty and plt is not None:
-        st.markdown("#### 카테고리별 비율")
-        fig = plt.figure()
-        plt.pie(by_cat["amount"], labels=by_cat["category"], autopct="%1.0f%%")
-        plt.title("카테고리별 지출 비율")
-        st.pyplot(fig)
+    # 카테고리별 합계 파이차트
+    df_cat = df.groupby("category", as_index=False)["amount"].sum()
+    df_cat = df_cat[df_cat["amount"] > 0]  # 0원/빈 카테고리 제거
+
+    if not df_cat.empty:
+        fig2, ax2 = plt.subplots()
+        ax2.pie(
+            df_cat["amount"].values,
+            labels=df_cat["category"].values,
+            autopct=lambda p: f"{p:.0f}%" if p > 0 else ""
+        )
+        ax2.set_title("카테고리별 지출 비중")
+        ax2.axis("equal")
+        fig2.tight_layout()
+        st.pyplot(fig2)
+        plt.close(fig2)
+    else:
+        st.info("카테고리별 지출이 아직 없어요. 금액이 있는 항목을 추가해 주세요.")
+
 
     delx = st.number_input("지출 삭제 ID", min_value=0, step=1, value=0, key="exp_del_id")
     if st.button("지출 삭제", key="exp_del_btn") and delx>0:
