@@ -1,4 +1,4 @@
-import streamlit as st, pandas as pd, datetime as dt, random, math
+import streamlit as st, pandas as pd, datetime as dt
 import database as DB
 import auth as AUTH
 from planner_core import best_windows, optimize_route
@@ -26,6 +26,10 @@ STATUS_SYMBOL  = {"off":"×","eve":"3","pm":"5","am":"7","full":"F"}
 STATUS_KO      = {"off":"불가","eve":"3시간/모름","pm":"5시간","am":"7시간","full":"하루종일"}
 def level_rank(s): return {"off":0,"eve":1,"pm":2,"am":3,"full":4}.get(s,0)
 
+def badge(status, text=None):
+    c = COLOR[status]; t = text or c["label"]
+    return f'<span style="background:{c["bg"]};color:{c["fg"]};padding:4px 8px;border-radius:8px;">{t}</span>'
+
 def legend():
     st.markdown("""
 <style>
@@ -43,33 +47,110 @@ def legend():
 def chip(txt):
     return f'<span style="background:#f5f5f5;border:1px solid #ddd;padding:2px 8px;border-radius:999px;margin-right:6px;display:inline-block">{txt}</span>'
 
+# -------- 매트릭스 렌더 --------
+def build_person_day_map(days_seq, names_by_day):
+    persons=set()
+    for d in days_seq:
+        for s in ("full","am","pm","eve"):
+            for n in names_by_day.get(d,{}).get(s, []):
+                persons.add(n)
+    persons=sorted(persons, key=lambda x:x.lower())
+    pmap={n:{} for n in persons}
+    for d in days_seq:
+        for s in ("full","am","pm","eve"):
+            for n in names_by_day.get(d,{}).get(s, []):
+                pmap[n][d]=s
+        for n in persons:
+            pmap[n].setdefault(d,"off")
+    return persons, pmap
+
+def render_availability_matrix(days_seq, names_by_day, title=None, note=None, max_rows=None):
+    persons, pmap = build_person_day_map(days_seq, names_by_day)
+    if max_rows: persons = persons[:max_rows]
+    header = "".join(
+        f'<th style="position:sticky;top:0;background:#fff;border-bottom:1px solid #eee;'
+        f'font-weight:600;font-size:12px;padding:6px 4px;text-align:center">{d[5:]}</th>'
+        for d in days_seq
+    )
+    rows=[]
+    for n in persons:
+        cells=[]
+        for d in days_seq:
+            s = pmap[n][d]; c = COLOR[s]
+            sym = STATUS_SYMBOL[s]
+            tip = f"{n} · {d} · {STATUS_KO[s]}"
+            cells.append(
+                f'<td title="{tip}" style="text-align:center;padding:2px 3px;">'
+                f'<div style="width:24px;height:18px;border-radius:5px;background:{c["bg"]};color:{c["fg"]};'
+                f'display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px">{sym}</div>'
+                f'</td>'
+            )
+        rows.append(
+            f'<tr>'
+            f'<td style="position:sticky;left:0;background:#fff;font-size:13px;padding:4px 8px;'
+            f'border-right:1px solid #eee;white-space:nowrap">{n}</td>'
+            f'{"".join(cells)}'
+            f'</tr>'
+        )
+    html = f"""
+<div style="margin-top:6px;margin-bottom:10px">
+  {f'<div style="font-weight:700;margin-bottom:4px">{title}</div>' if title else ''}
+  <div style="overflow:auto;border:1px solid #eee;border-radius:10px">
+    <table style="border-collapse:separate;border-spacing:0;min-width:100%">
+      <thead><tr>
+        <th style="position:sticky;left:0;z-index:2;background:#fff;border-bottom:1px solid #eee;padding:6px 8px;text-align:left">이름</th>
+        {header}
+      </tr></thead>
+      <tbody>
+        {"".join(rows) or '<tr><td style="padding:8px">데이터 없음</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+  {f'<div style="color:#666;font-size:12px;margin-top:6px">{note}</div>' if note else ''}
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
 # ===== 겹치거나 인접(하루 차이) 구간 병합 =====
 def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
-    if not raw_top: return []
-    intervals=[]
+    """best_windows 결과를 받아 겹치거나 바로 붙는 날짜 구간을 하나로 합쳐서
+    days/score/feasible을 재계산한다."""
+    if not raw_top:
+        return []
+
+    # 1) interval로 변환
+    intervals = []
     for w in raw_top:
         start_d = dt.date.fromisoformat(w["days"][0])
         end_d   = dt.date.fromisoformat(w["days"][-1])
-        intervals.append({"start":start_d, "end":end_d, "days":set(w["days"])})
-    intervals.sort(key=lambda x:x["start"])
-    merged=[]; cur=intervals[0]
+        intervals.append({"start": start_d, "end": end_d, "days": set(w["days"])})
+
+    # 2) 시작일 기준 정렬 후 병합(겹치거나 하루 인접하면 합침)
+    intervals.sort(key=lambda x: x["start"])
+    merged = []
+    cur = intervals[0]
     for nxt in intervals[1:]:
         if nxt["start"] <= cur["end"] + dt.timedelta(days=1):
-            cur["end"] = max(cur["end"], nxt["end"])
+            cur["end"]  = max(cur["end"], nxt["end"])
             cur["days"] |= nxt["days"]
         else:
-            merged.append(cur); cur=nxt
+            merged.append(cur)
+            cur = nxt
     merged.append(cur)
-    out=[]
+
+    # 3) 점수/충족 여부 재계산
+    out = []
     for m in merged:
-        days_sorted=sorted(list(m["days"]))
-        score=sum(agg_by_day[d]["score"] for d in days_sorted)
-        feasible=all(
-            (agg_by_day[d]["full"]+agg_by_day[d]["am"]+agg_by_day[d]["pm"]+agg_by_day[d]["eve"])>=quorum
+        days_sorted = sorted(list(m["days"]))
+        score = sum(agg_by_day[d]["score"] for d in days_sorted)
+        feasible = all(
+            (agg_by_day[d]["full"] + agg_by_day[d]["am"] + agg_by_day[d]["pm"] + agg_by_day[d]["eve"]) >= quorum
             for d in days_sorted
         )
-        out.append({"days":days_sorted,"score":score,"feasible":feasible})
-    out.sort(key=lambda w:(-w["score"], w["days"][0]))
+        out.append({"days": days_sorted, "score": score, "feasible": feasible})
+
+    # 점수 내림차순, 시작일 오름차순
+    out.sort(key=lambda w: (-w["score"], w["days"][0]))
     return out
 
 # ---------------- Auth ----------------
@@ -176,55 +257,6 @@ def dashboard():
                                  int(min_days), int(quorum), wfull, wam, wpm, wev)
             st.success(f"방 생성! 코드: **{rid}**"); _rerun()
 
-# ---------------- Ladder SVG ----------------
-def render_ladder_svg(names, results, width=680, height_per=60, rung_density=0.18, seed=None):
-    """간단한 사다리 SVG 생성(가로선 랜덤)."""
-    if seed is not None:
-        random.seed(seed)
-    n = len(names)
-    height = max(260, int(height_per * 6))
-    cols_x = [40 + i * ((width-80)//(n-1) if n>1 else 1) for i in range(n)]
-    top_y, bottom_y = 40, height - 40
-
-    # 가로선 생성
-    rungs=[]
-    steps = int((bottom_y - top_y) * rung_density)
-    for _ in range(steps):
-        i = random.randint(0, max(0, n-2))
-        y = random.randint(top_y+10, bottom_y-10)
-        rungs.append((i, y))
-    rungs = sorted(rungs, key=lambda x:x[1])
-
-    # 경로 흐름 계산
-    path_idx = list(range(n))
-    for (i,y) in rungs:
-        a,b = path_idx[i], path_idx[i+1]
-        path_idx[i], path_idx[i+1] = b,a
-
-    # SVG 조립
-    lines = []
-    # 수직선
-    for x in cols_x:
-        lines.append(f'<line x1="{x}" y1="{top_y}" x2="{x}" y2="{bottom_y}" stroke="#888" stroke-width="3"/>')
-    # 가로선
-    for (i,y) in rungs:
-        x1, x2 = cols_x[i], cols_x[i+1]
-        lines.append(f'<line x1="{x1}" y1="{y}" x2="{x2}" y2="{y}" stroke="#aaa" stroke-width="3"/>')
-    # 라벨
-    labels=[]
-    for i,x in enumerate(cols_x):
-        labels.append(f'<text x="{x}" y="{top_y-10}" text-anchor="middle" font-size="14">{names[i]}</text>')
-        labels.append(f'<text x="{x}" y="{bottom_y+22}" text-anchor="middle" font-size="14">{results[path_idx[i]]}</text>')
-
-    svg = f'''
-    <svg width="{width}" height="{bottom_y+60}" xmlns="http://www.w3.org/2000/svg">
-      <rect x="0" y="0" width="{width}" height="{bottom_y+60}" fill="#fff"/>
-      {''.join(lines)}
-      {''.join(labels)}
-    </svg>
-    '''
-    return svg
-
 # ---------------- Room ----------------
 def room_page():
     require_login()
@@ -239,18 +271,18 @@ def room_page():
         st.session_state.pop("room_id", None)
         _rerun(); return
 
-    me = st.session_state["user_id"]
-    is_owner = (room["owner_id"] == me)
-    is_admin = DB.is_site_admin(me)
-    am_member = any(m["id"]==me for m in members)
-    # 웹 관리자이면서 그 방의 멤버면, 방장급 권한 부여
-    is_owner_or_admin = is_owner or (is_admin and am_member)
+    is_owner = (room["owner_id"] == st.session_state["user_id"])
+    is_admin = DB.is_site_admin(st.session_state["user_id"])
+    is_manager = is_owner or is_admin  # 👉 관리자도 방장급 권한
 
     # 헤더 + 레전드
     st.header(f"방: {room['title']} ({rid})")
     st.caption(f"{room['start']} ~ {room['end']} / 최소{room['min_days']}일 / 쿼럼{room['quorum']}")
+
+    # 최종 선택 표시
     if room["final_start"] and room["final_end"]:
         st.success(f"✅ 최종 확정: **{room['final_start']} ~ {room['final_end']}**")
+
     legend()
 
     # ----- 사이드바: 공지 & 투표 -----
@@ -266,41 +298,23 @@ def room_page():
             for a in anns:
                 st.markdown(f"**{a['title']}**  · {a['created_at'][:16].replace('T',' ')}")
                 st.caption(a["body"])
-                # 댓글
-                cmts = DB.list_announcement_comments(a["id"])
-                if cmts:
-                    for c in cmts:
-                        st.markdown(f"- {c['uname']} : {c['body']}  _({c['created_at'][:16].replace('T',' ')})_")
-                new_c = st.text_input("댓글 달기", key=f"annc_{a['id']}")
-                if st.button("등록", key=f"annc_add_{a['id']}"):
-                    if new_c.strip():
-                        DB.add_announcement_comment(a["id"], rid, me, new_c.strip()); st.success("댓글 등록"); _rerun()
-                # 공지 관리(방장+관리자만)
-                if is_owner_or_admin:
-                    c1,c2,c3 = st.columns(3)
+                if is_manager:  # 👈 관리자 가능
+                    c1,c2 = st.columns(2)
                     with c1:
                         if st.button(("고정 해제" if a["pinned"] else "고정"), key=f"pin_{a['id']}"):
-                            if is_owner:
-                                DB.toggle_pin_announcement(a["id"], rid, room["owner_id"])
-                            else:
-                                DB.admin_toggle_pin_announcement(a["id"], rid)
-                            _rerun()
+                            DB.toggle_pin_announcement(a["id"], rid, room["owner_id"]); _rerun()
                     with c2:
                         if st.button("삭제", key=f"delann_{a['id']}"):
-                            if is_owner:
-                                DB.delete_announcement(a["id"], rid, room["owner_id"])
-                            else:
-                                DB.admin_delete_announcement(a["id"], rid)
-                            _rerun()
+                            DB.delete_announcement(a["id"], rid, room["owner_id"]); _rerun()
                 st.markdown("---")
-        if is_owner_or_admin:
+        if is_manager:  # 👈 관리자 가능
             st.caption("새 공지")
             ann_title = st.text_input("제목", key="ann_title_sb")
             ann_body  = st.text_area("내용", key="ann_body_sb")
             ann_pin   = st.checkbox("고정", value=False, key="ann_pin_sb")
             if st.button("등록", key="ann_add_sb"):
                 if ann_title.strip():
-                    DB.add_announcement(rid, ann_title.strip(), ann_body.strip(), int(ann_pin), me)
+                    DB.add_announcement(rid, ann_title.strip(), ann_body.strip(), int(ann_pin), st.session_state["user_id"])
                     st.success("등록됨"); _rerun()
                 else:
                     st.error("제목은 필수예요.")
@@ -314,7 +328,7 @@ def room_page():
             for p in polls:
                 st.markdown(f"**{p['question']}**" + (f" · 마감 {p['closes_at'][:16].replace('T',' ')}" if p["closes_at"] else ""))
                 opts = DB.list_poll_options(p["id"])
-                my_votes = set(DB.get_user_votes(p["id"], me))
+                my_votes = set(DB.get_user_votes(p["id"], st.session_state["user_id"]))
                 if p["is_multi"]:
                     picked = st.multiselect("선택", [o["id"] for o in opts], default=list(my_votes),
                                             format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
@@ -325,14 +339,14 @@ def room_page():
                                       format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
                     picked = [picked]
                 if st.button("투표/변경", key=f"vote_{p['id']}"):
-                    DB.cast_vote(p["id"], picked, me, bool(p["is_multi"]))
+                    DB.cast_vote(p["id"], picked, st.session_state["user_id"], bool(p["is_multi"]))
                     st.success("반영됨"); _rerun()
                 counts, total = DB.tally_poll(p["id"])
                 for o in opts:
                     c = counts.get(o["id"], 0); ratio = (c/total*100) if total else 0
                     st.progress(min(1.0, ratio/100.0), text=f"{o['text']} · {c}표 ({ratio:0.0f}%)")
                 st.markdown("---")
-        if is_owner_or_admin:
+        if is_manager:  # 👈 관리자 가능
             with st.expander("새 투표 만들기", expanded=False):
                 q = st.text_input("질문", key="newpoll_q")
                 raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
@@ -342,14 +356,14 @@ def room_page():
                     options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
                     closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
                     if q.strip() and options:
-                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, me)
+                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, st.session_state["user_id"])
                         st.success("투표 생성!"); _rerun()
                     else:
                         st.error("질문과 보기 필요")
 
     # ---- 방장/관리자 관리 ----
-    if is_owner_or_admin:
-        with st.expander("👑 방 관리", expanded=False):
+    if is_manager:
+        with st.expander("👑 방 관리 (방장+관리자)", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1: new_title = st.text_input("제목", room["title"])
             with c2: start = st.date_input("시작", dt.date.fromisoformat(room["start"]))
@@ -367,20 +381,12 @@ def room_page():
             b1, b2, b3 = st.columns(3)
             with b1:
                 if st.button("설정 저장", key="owner_save"):
-                    if is_owner:
-                        DB.update_room(
-                            room["owner_id"], rid,
-                            title=new_title, start=start.isoformat(), end=end.isoformat(),
-                            min_days=int(min_days), quorum=int(quorum),
-                            w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev
-                        )
-                    else:
-                        DB.admin_update_room(
-                            rid,
-                            title=new_title, start=start.isoformat(), end=end.isoformat(),
-                            min_days=int(min_days), quorum=int(quorum),
-                            w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev
-                        )
+                    DB.update_room(
+                        room["owner_id"], rid,
+                        title=new_title, start=start.isoformat(), end=end.isoformat(),
+                        min_days=int(min_days), quorum=int(quorum),
+                        w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev
+                    )
                     st.success("저장 완료"); _rerun()
             with b2:
                 inv_email = st.text_input("초대 이메일", key="invite_email")
@@ -392,12 +398,15 @@ def room_page():
                         ok, msg = DB.invite_user_by_email(rid, email_str)
                         (st.success if ok else st.error)(str(msg)); _rerun()
             with b3:
-                if is_owner and st.button("⚠️ 방 삭제", type="secondary", key="room_delete"):
-                    DB.delete_room(rid, room["owner_id"])
-                    st.success("방 삭제 완료")
-                    st.session_state["page"] = "dashboard"
-                    st.session_state.pop("room_id", None)
-                    _rerun()
+                if st.button("⚠️ 방 삭제", type="secondary", key="room_delete"):
+                    ok = DB.delete_room(rid, st.session_state["user_id"])  # 👉 방장 or 관리자 가능
+                    if ok:
+                        st.success("방 삭제 완료")
+                        st.session_state["page"] = "dashboard"
+                        st.session_state.pop("room_id", None)
+                        _rerun()
+                    else:
+                        st.error("삭제 권한이 없습니다.")
 
         st.markdown("#### 멤버 목록")
         st.dataframe(
@@ -423,13 +432,14 @@ def room_page():
 
     # ---- 탭 ----
     st.markdown("---")
-    tab_time, tab_plan, tab_cost, tab_fun = st.tabs(["⏰ 시간/약속", "🗺️ 계획 & 동선 / 예산", "💳 정산", "🎲 추첨/사다리"])
+    tab_time, tab_plan, tab_cost = st.tabs(["⏰ 시간/약속", "🗺️ 계획 & 동선 / 예산", "💳 정산"])
 
     # ========== ⏰ 시간/약속 ==========
     with tab_time:
         st.subheader("내 달력 입력")
         my_av = DB.get_my_availability(st.session_state["user_id"], rid)
 
+        # 범위 → DataFrame
         days = []
         d0 = dt.date.fromisoformat(room["start"]); d1 = dt.date.fromisoformat(room["end"])
         cur = d0
@@ -492,6 +502,7 @@ def room_page():
         room_row, days_list, agg, weights = DB.day_aggregate(rid)
         names_by_day = DB.availability_names_by_day(rid)
 
+        # 날짜별 요약 표
         df_agg = pd.DataFrame([
             {
                 "date": d,
@@ -507,6 +518,7 @@ def room_page():
         ])
         st.dataframe(df_agg, use_container_width=True, hide_index=True)
 
+        # 날짜별 뱃지
         st.markdown("#### 날짜별 가능 멤버(뱃지)")
         pick_for_names = st.selectbox("날짜 선택", days_list, index=0, key="names_day_pick")
         nb = names_by_day.get(pick_for_names, {})
@@ -514,6 +526,7 @@ def room_page():
             chips = " ".join(chip(n) for n in nb.get(key, [])) or "(없음)"
             st.markdown(f"**{label}** · {chips}", unsafe_allow_html=True)
 
+        # --------- 추천 계산 (Top‑7 + 병합) ---------
         raw_top = best_windows(days_list, agg, int(room_row["min_days"]), int(room_row["quorum"]))
         if raw_top:
             merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
@@ -526,10 +539,7 @@ def room_page():
                         st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
                     with colR:
                         if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
-                            if is_owner:
-                                DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
-                            elif is_admin:
-                                DB.admin_set_final_window(rid, days_seq[0], days_seq[-1])
+                            DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
                             st.success("최종 일정으로 저장했습니다."); _rerun()
                 else:
                     st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
@@ -546,8 +556,8 @@ def room_page():
                             rec["lowest"] = min(rec["lowest"], s, key=level_rank)
                 full_ok = [ (n, stats[n]["lowest"]) for n in all_names if stats[n]["cnt"] == K ]
                 part_ok = [ (n, stats[n]["lowest"], stats[n]["cnt"]) for n in all_names if 0 < stats[n]["cnt"] < K ]
-                full_ok.sort(key=lambda x: (-{"off":0,"eve":1,"pm":2,"am":3,"full":4}[x[1]], x[0].lower()))
-                part_ok.sort(key=lambda x: (-x[2], -{"off":0,"eve":1,"pm":2,"am":3,"full":4}[x[1]], x[0].lower()))
+                full_ok.sort(key=lambda x: (-level_rank(x[1]), x[0].lower()))
+                part_ok.sort(key=lambda x: (-x[2], -level_rank(x[1]), x[0].lower()))
                 level_label={"full":"하루종일","am":"7시간","pm":"5시간","eve":"3시간/모름"}
                 chips_full = " ".join(chip(f"{n} · {level_label.get(lvl,lvl)}") for n,lvl in full_ok) or "(없음)"
                 st.markdown("가능 멤버(구간 **전체**): " + chips_full, unsafe_allow_html=True)
@@ -557,17 +567,24 @@ def room_page():
 
             for i, w in enumerate(merged_top[:7], 1):
                 st.write(f"**#{i}**")
-                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_owner_or_admin)
-                # 미니 매트릭스
-                persons = set()
-                names_by_day = DB.availability_names_by_day(rid)
-                # 간단 매트릭스(상세 렌더 함수는 생략)
-                st.caption(f"{w['days'][0]} ~ {w['days'][-1]} 상세는 위 멤버 뱃지 참고!")
-
+                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_manager)
+                render_availability_matrix(
+                    w["days"], names_by_day,
+                    title="사람×날짜 가능수준 (F/7/5/3/×)",
+                    note="칸에 마우스를 올리면 상태 툴팁이 보여요."
+                )
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):
             st.success("모든 인원이 제출 완료! 위 추천 구간을 참고해 최종 확정하세요 ✅")
+
+        # --- 전체 타임라인 (옵션) ---
+        if st.toggle("사람별 타임라인(전체 기간) 보기", value=False):
+            render_availability_matrix(
+                days_list, names_by_day,
+                title="전체 기간 타임라인 (F/7/5/3/×)",
+                note="이름/날짜 헤더는 스크롤해도 고정됩니다."
+            )
 
     # ========== 🗺️ 계획 & 동선 / 예산 ==========
     with tab_plan:
@@ -680,11 +697,11 @@ def room_page():
                 items_sorted = sorted(items, key=lambda r:r["position"])
                 coords=[]
                 for i,it in enumerate(items_sorted, start=1):
-                    if it["lat"] and it["lon"]):
+                    if it["lat"] and it["lon"]:
                         coords.append((it["lat"], it["lon"]))
                         popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
                         folium.Marker(
-                            [it["lat"], it["lon"]],
+                            [it["lat"] , it["lon"]],
                             popup=popup, tooltip=popup,
                             icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")
                         ).add_to(m)
@@ -740,43 +757,6 @@ def room_page():
                 st.write("**이체 추천 목록 (최소 이체 수)**")
                 for t in transfers:
                     st.write(f"- {name_of[t['from']]} → {name_of[t['to']]} : **{int(t['amount'])}원**")
-
-    # ========== 🎲 추첨/사다리 ==========
-    with tab_fun:
-        st.subheader("랜덤 제비뽑기 / 사다리게임")
-        base_names = [ (m["nickname"] or m["name"]) for m in members ]
-        st.caption("방 멤버 리스트를 기본으로 사용합니다. 직접 수정해도 됩니다.")
-        names_text = st.text_area("참가자(줄바꿈 구분)", value="\n".join(base_names), height=120, key="lot_names")
-        names = [s.strip() for s in names_text.splitlines() if s.strip()]
-        colA, colB = st.columns(2)
-
-        with colA:
-            st.markdown("**🎯 제비뽑기(랜덤 섞기)**")
-            k = st.number_input("뽑을 인원 수 (0이면 전체 섞기)", min_value=0, max_value=max(0,len(names)), value=0, step=1, key="draw_k")
-            seed = st.text_input("시드(선택, 같은 결과 재현)", value="", key="draw_seed")
-            if st.button("뽑기 실행", key="do_draw"):
-                rnd = random.Random(seed or None)
-                shuffled = names[:]; rnd.shuffle(shuffled)
-                if k>0:
-                    st.success("당첨자:")
-                    for i, n in enumerate(shuffled[:k], 1):
-                        st.write(f"- #{i} {n}")
-                else:
-                    st.success("섞은 순서:")
-                    for i, n in enumerate(shuffled, 1):
-                        st.write(f"- #{i} {n}")
-
-        with colB:
-            st.markdown("**🪜 사다리게임(네이버 스타일 간단 SVG)**")
-            results_text = st.text_area("결과(줄바꿈, 참가자 수와 같게)", value="\n".join([f"결과{i+1}" for i in range(len(names) or 2)]), height=120, key="ladder_results")
-            seed2 = st.text_input("시드(선택)", value="", key="ladder_seed")
-            if st.button("사다리 실행", key="do_ladder"):
-                results = [s.strip() for s in results_text.splitlines() if s.strip()]
-                if len(results) != len(names):
-                    st.error("참가자 수와 결과 수가 같아야 합니다.")
-                else:
-                    svg = render_ladder_svg(names, results, seed=(seed2 or None))
-                    st.components.v1.html(svg, height=420, scrolling=False)
 
 # ---------------- Router ----------------
 def router():
