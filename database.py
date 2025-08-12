@@ -1,4 +1,4 @@
-import sqlite3, os, bcrypt, secrets, string, datetime as dt
+import sqlite3, os, bcrypt, secrets, string, datetime as dt, re
 
 DB_PATH = os.environ.get("PLANNER_DB", "planner.sqlite")
 
@@ -10,7 +10,6 @@ def get_conn():
 def init_db():
     conn = get_conn(); cur = conn.cursor()
 
-    # 기본 테이블
     cur.executescript("""
     PRAGMA journal_mode=WAL;
 
@@ -45,7 +44,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS memberships(
       user_id INTEGER NOT NULL,
       room_id TEXT NOT NULL,
-      role    TEXT NOT NULL,
+      role    TEXT NOT NULL, -- owner/member
       submitted INTEGER NOT NULL DEFAULT 0,
       UNIQUE(user_id, room_id),
       FOREIGN KEY(user_id) REFERENCES users(id),
@@ -56,15 +55,12 @@ def init_db():
       user_id INTEGER NOT NULL,
       room_id TEXT NOT NULL,
       day TEXT NOT NULL,
-      status TEXT NOT NULL,
+      status TEXT NOT NULL, -- off/eve/pm/am/full
       PRIMARY KEY(user_id, room_id, day),
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(room_id) REFERENCES rooms(id)
     );
-    """)
 
-    # 계획/동선
-    cur.executescript("""
     CREATE TABLE IF NOT EXISTS itinerary_items(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -82,10 +78,7 @@ def init_db():
       FOREIGN KEY(room_id) REFERENCES rooms(id),
       FOREIGN KEY(created_by) REFERENCES users(id)
     );
-    """)
 
-    # 지출/정산
-    cur.executescript("""
     CREATE TABLE IF NOT EXISTS expenses(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -95,13 +88,11 @@ def init_db():
       amount REAL NOT NULL,
       memo TEXT,
       created_at TEXT NOT NULL,
+      category TEXT,
       FOREIGN KEY(room_id) REFERENCES rooms(id),
       FOREIGN KEY(payer_id) REFERENCES users(id)
     );
-    """)
 
-    # 공지
-    cur.executescript("""
     CREATE TABLE IF NOT EXISTS announcements(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -113,10 +104,7 @@ def init_db():
       FOREIGN KEY(room_id) REFERENCES rooms(id),
       FOREIGN KEY(created_by) REFERENCES users(id)
     );
-    """)
 
-    # 투표
-    cur.executescript("""
     CREATE TABLE IF NOT EXISTS polls(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_id TEXT NOT NULL,
@@ -144,22 +132,8 @@ def init_db():
       FOREIGN KEY(option_id) REFERENCES poll_options(id),
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
-    """)
 
-    # 리셋 토큰
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS reset_tokens(
-      token TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    """)
-
-    # --- 사이트 관리자 ---
-    cur.executescript("""
+    -- 사이트 관리자(앱 운영자)
     CREATE TABLE IF NOT EXISTS site_admins(
       user_id INTEGER PRIMARY KEY,
       granted_at TEXT NOT NULL,
@@ -167,67 +141,37 @@ def init_db():
     );
     """)
 
-    # ---- 마이그레이션(컬럼 추가 보정) ----
-    cur.execute("PRAGMA table_info(rooms)")
-    cols = [r[1] for r in cur.fetchall()]
-    if "final_start" not in cols:
-        cur.execute("ALTER TABLE rooms ADD COLUMN final_start TEXT")
-    if "final_end" not in cols:
-        cur.execute("ALTER TABLE rooms ADD COLUMN final_end TEXT")
-
+    # 마이그레이션 보정
+    for tbl, col in (("rooms","final_start"), ("rooms","final_end")):
+        cur.execute(f"PRAGMA table_info({tbl})")
+        cols = [r[1] for r in cur.fetchall()]
+        if col not in cols:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
     cur.execute("PRAGMA table_info(users)")
-    ucols = [r[1] for r in cur.fetchall()]
+    ucols=[r[1] for r in cur.fetchall()]
     if "nickname" not in ucols:
         cur.execute("ALTER TABLE users ADD COLUMN nickname TEXT")
-        cur.execute("UPDATE users SET nickname = name WHERE nickname IS NULL OR nickname=''")
+        cur.execute("UPDATE users SET nickname=name WHERE nickname IS NULL OR nickname=''")
+    cur.execute("PRAGMA table_info(expenses)")
+    ecols=[r[1] for r in cur.fetchall()]
+    if "category" not in ecols:
+        cur.execute("ALTER TABLE expenses ADD COLUMN category TEXT")
 
     conn.commit(); conn.close()
 
-# ---- Site admin helpers ----
-def is_site_admin(user_id:int)->bool:
-    if not user_id: return False
-    c=get_conn().cursor(); c.execute("SELECT 1 FROM site_admins WHERE user_id=?", (user_id,))
-    r=c.fetchone(); c.connection.close(); return bool(r)
-
-def grant_admin_by_email(email:str)->bool:
-    u=get_user_by_email(email)
-    if not u: return False
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO site_admins(user_id,granted_at) VALUES(?,?)",
-                (u["id"], dt.datetime.utcnow().isoformat()))
-    conn.commit(); ok = cur.rowcount>=1
-    conn.close(); return ok
-
-def revoke_admin_by_email(email:str)->bool:
-    u=get_user_by_email(email)
-    if not u: return False
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("DELETE FROM site_admins WHERE user_id=?", (u["id"],))
-    conn.commit(); ok = cur.rowcount>=1
-    conn.close(); return ok
-
-def list_site_admins():
-    c=get_conn().cursor()
-    c.execute("""SELECT u.id,u.email,COALESCE(u.nickname,u.name) AS name,s.granted_at
-                 FROM site_admins s JOIN users u ON u.id=s.user_id
-                 ORDER BY s.granted_at DESC""")
-    rows=c.fetchall(); c.connection.close(); return rows
-
 # ---- Auth primitives ----
-def hash_pw(pw:str)->bytes:
-    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
-
+def hash_pw(pw:str)->bytes: return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt())
 def check_pw(pw:str, pw_hash:bytes)->bool:
     try: return bcrypt.checkpw(pw.encode("utf-8"), pw_hash)
     except Exception: return False
 
 def email_exists(email:str)->bool:
     c=get_conn().cursor(); c.execute("SELECT 1 FROM users WHERE email=?", (email,)); r=c.fetchone(); c.connection.close(); return bool(r)
-
 def nickname_exists(nick:str)->bool:
     c=get_conn().cursor(); c.execute("SELECT 1 FROM users WHERE nickname=?", (nick,)); r=c.fetchone(); c.connection.close(); return bool(r)
 
 def create_user(email:str, name:str, nickname:str, pw:str):
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email or ""): raise ValueError("bad_email")
     if email_exists(email): raise ValueError("email_taken")
     if nickname and nickname_exists(nickname): raise ValueError("nickname_taken")
     conn=get_conn(); cur=conn.cursor()
@@ -237,44 +181,39 @@ def create_user(email:str, name:str, nickname:str, pw:str):
 
 def get_user_by_email(email:str):
     c=get_conn().cursor(); c.execute("SELECT * FROM users WHERE email=?", (email,)); r=c.fetchone(); c.connection.close(); return r
-
 def get_user_by_login(login:str):
     conn=get_conn(); cur=conn.cursor()
     cur.execute("SELECT * FROM users WHERE email=?", (login,)); row=cur.fetchone()
     if not row:
         cur.execute("SELECT * FROM users WHERE nickname=?", (login,)); row=cur.fetchone()
     conn.close(); return row
-
 def get_user(user_id:int):
     c=get_conn().cursor(); c.execute("SELECT * FROM users WHERE id=?", (user_id,)); r=c.fetchone(); c.connection.close(); return r
-
 def update_password(user_id:int, new_pw:str):
     conn=get_conn(); cur=conn.cursor()
     cur.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(new_pw), user_id))
     conn.commit(); conn.close()
 
-# reset token
-def create_reset_token(email:str, ttl_minutes:int=30):
-    user = get_user_by_email(email)
-    if not user: return None, "no_user"
-    token = secrets.token_urlsafe(32)
-    expires = (dt.datetime.utcnow() + dt.timedelta(minutes=ttl_minutes)).isoformat()
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("INSERT INTO reset_tokens(token,user_id,expires_at,used,created_at) VALUES(?,?,?,?,?)",
-                (token, user["id"], expires, 0, dt.datetime.utcnow().isoformat()))
-    conn.commit(); conn.close(); return token, "ok"
+# ----- 사이트 관리자 -----
+def is_site_admin(user_id:int|None)->bool:
+    if not user_id: return False
+    c=get_conn().cursor(); c.execute("SELECT 1 FROM site_admins WHERE user_id=?", (user_id,))
+    ok=bool(c.fetchone()); c.connection.close(); return ok
 
-def verify_reset_token(token:str):
-    c=get_conn().cursor(); c.execute("SELECT * FROM reset_tokens WHERE token=?", (token,)); row=c.fetchone(); c.connection.close()
-    if not row: return None, "not_found"
-    if row["used"]: return None, "used"
-    if dt.datetime.fromisoformat(row["expires_at"]) < dt.datetime.utcnow(): return None, "expired"
-    return row, "ok"
-
-def consume_reset_token(token:str):
+def grant_admin_by_email(email:str)->bool:
+    u=get_user_by_email(email)
+    if not u: return False
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("UPDATE reset_tokens SET used=1 WHERE token=?", (token,))
-    conn.commit(); conn.close()
+    cur.execute("INSERT OR IGNORE INTO site_admins(user_id,granted_at) VALUES(?,?)",
+                (u["id"], dt.datetime.utcnow().isoformat()))
+    conn.commit(); ok=cur.rowcount>=1; conn.close(); return ok
+
+def revoke_admin_by_email(email:str)->bool:
+    u=get_user_by_email(email)
+    if not u: return False
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute("DELETE FROM site_admins WHERE user_id=?", (u["id"],))
+    conn.commit(); ok=cur.rowcount>=1; conn.close(); return ok
 
 # ---- Rooms / Members ----
 def gen_room_id(n=6):
@@ -294,44 +233,54 @@ def create_room(owner_id:int, title:str, start:str, end:str, min_days:int, quoru
                 (owner_id,rid,"owner"))
     conn.commit(); conn.close(); return rid
 
-def update_room(actor_id:int, room_id:str, **fields):
+def update_room(owner_id:int, room_id:str, **fields):
     if not fields: return False
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close(); return False
-    if not (row["owner_id"] == actor_id or is_site_admin(actor_id)):
-        conn.close(); return False
     keys, vals = [], []
     for k,v in fields.items():
         if k in ("title","start","end","min_days","quorum","w_full","w_am","w_pm","w_eve","final_start","final_end"):
             keys.append(f"{k}=?"); vals.append(v)
-    if not keys:
-        conn.close(); return False
-    vals.append(room_id)
+    if not keys: return False
+    vals += [owner_id, room_id]
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute(f"UPDATE rooms SET {', '.join(keys)} WHERE owner_id=? AND id=?", vals)
+    conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
+
+def update_room_as_admin(room_id:str, **fields):
+    # 사이트 관리자는 owner 제한 없이 수정 가능
+    if not fields: return False
+    keys, vals = [], []
+    for k,v in fields.items():
+        if k in ("title","start","end","min_days","quorum","w_full","w_am","w_pm","w_eve","final_start","final_end"):
+            keys.append(f"{k}=?"); vals.append(v)
+    if not keys: return False
+    vals += [room_id]
+    conn=get_conn(); cur=conn.cursor()
     cur.execute(f"UPDATE rooms SET {', '.join(keys)} WHERE id=?", vals)
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
-def delete_room(room_id:str, actor_id:int):
+def delete_room(room_id:str, owner_id:int):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
-    r = cur.fetchone()
-    if not r:
-        conn.close(); return False
-    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
-        conn.close(); return False
+    cur.execute("DELETE FROM rooms WHERE id=? AND owner_id=?", (room_id, owner_id))
+    if cur.rowcount:
+        _cascade_cleanup(cur, room_id)
+    conn.commit(); conn.close(); return True
+
+def delete_room_any(room_id:str):
+    conn=get_conn(); cur=conn.cursor()
     cur.execute("DELETE FROM rooms WHERE id=?", (room_id,))
     if cur.rowcount:
-        cur.execute("DELETE FROM memberships WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM availability WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM itinerary_items WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM expenses WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM announcements WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM polls WHERE room_id=?", (room_id,))
-        cur.execute("DELETE FROM poll_options WHERE poll_id NOT IN (SELECT id FROM polls)")
-        cur.execute("DELETE FROM poll_votes WHERE poll_id NOT IN (SELECT id FROM polls)")
+        _cascade_cleanup(cur, room_id)
     conn.commit(); conn.close(); return True
+
+def _cascade_cleanup(cur, room_id):
+    cur.execute("DELETE FROM memberships WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM availability WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM itinerary_items WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM expenses WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM announcements WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM polls WHERE room_id=?", (room_id,))
+    cur.execute("DELETE FROM poll_options WHERE poll_id NOT IN (SELECT id FROM polls)")
+    cur.execute("DELETE FROM poll_votes WHERE poll_id NOT IN (SELECT id FROM polls)")
 
 def list_my_rooms(user_id:int):
     conn=get_conn(); cur=conn.cursor()
@@ -365,8 +314,7 @@ def remove_member(room_id:str, user_id:int):
     conn.commit(); conn.close()
 
 # ---- Availability / Submission ----
-def get_weights(room):
-    return {"full":1.0, "am":0.7, "pm":0.5, "eve":0.4, "off":0.0}
+def get_weights(room): return {"full":1.0, "am":0.7, "pm":0.5, "eve":0.4, "off":0.0}
 
 def upsert_availability(user_id:int, room_id:str, items:dict):
     conn=get_conn(); cur=conn.cursor()
@@ -419,12 +367,11 @@ def day_aggregate(room_id:str):
     return room, days, agg, w
 
 def availability_names_by_day(room_id:str):
-    """{day:{status:[names...]}}"""
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute("""SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS name
-                   FROM availability a JOIN users u ON u.id=a.user_id
-                   WHERE a.room_id=?""", (room_id,))
-    rows=cur.fetchall(); conn.close()
+    conn=get_conn().cursor()
+    conn.execute("""SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS name
+                    FROM availability a JOIN users u ON u.id=a.user_id
+                    WHERE a.room_id=?""", (room_id,))
+    rows=conn.fetchall(); conn.connection.close()
     out={}
     for r in rows:
         d=r["day"]; s=r["status"]; n=r["name"]
@@ -434,24 +381,17 @@ def availability_names_by_day(room_id:str):
             out[d][s]=sorted(out[d][s], key=lambda x:x.lower())
     return out
 
-# 최종 확정 기간
-def set_final_window(room_id:str, actor_id:int, start:str, end:str)->bool:
+def set_final_window(room_id:str, owner_id:int, start:str, end:str)->bool:
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
-    r = cur.fetchone()
-    if not r:
-        conn.close(); return False
-    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
-        conn.close(); return False
+    cur.execute("UPDATE rooms SET final_start=?, final_end=? WHERE id=? AND owner_id=?",
+                (start, end, room_id, owner_id))
+    conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
+
+def set_final_window_any(room_id:str, start:str, end:str)->bool:
+    conn=get_conn(); cur=conn.cursor()
     cur.execute("UPDATE rooms SET final_start=?, final_end=? WHERE id=?",
                 (start, end, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
-
-def get_final_window(room_id:str):
-    c=get_conn().cursor(); c.execute("SELECT final_start, final_end FROM rooms WHERE id=?", (room_id,))
-    r=c.fetchone(); c.connection.close()
-    if not r or not r["final_start"] or not r["final_end"]: return None
-    return (r["final_start"], r["final_end"])
 
 # ---------- Itinerary ----------
 def list_items(room_id:str, day:str):
@@ -489,11 +429,11 @@ def delete_item(item_id:int, room_id:str):
     conn.commit(); conn.close()
 
 # ---------- Expenses ----------
-def add_expense(room_id:str, day:str, place:str, payer_id:int, amount:float, memo:str=None):
+def add_expense(room_id:str, day:str, place:str, payer_id:int, amount:float, memo:str=None, category:str=None):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("""INSERT INTO expenses(room_id,day,place,payer_id,amount,memo,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (room_id, day, place, payer_id, amount, memo, dt.datetime.utcnow().isoformat()))
+    cur.execute("""INSERT INTO expenses(room_id,day,place,payer_id,amount,memo,created_at,category)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (room_id, day, place, payer_id, amount, memo, dt.datetime.utcnow().isoformat(), category))
     conn.commit(); conn.close()
 
 def list_expenses(room_id:str):
@@ -546,23 +486,14 @@ def list_announcements(room_id:str):
                  ORDER BY pinned DESC, created_at DESC""", (room_id,))
     rows=c.fetchall(); c.connection.close(); return rows
 
-def toggle_pin_announcement(ann_id:int, room_id:str, actor_id:int):
+def toggle_pin_announcement(ann_id:int, room_id:str, owner_id:int):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
-    r = cur.fetchone()
-    if not r: conn.close(); return False
-    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
-        conn.close(); return False
+    # owner 인증은 상위 레벨에서 처리 (앱/관리자)
     cur.execute("UPDATE announcements SET pinned=1-pinned WHERE id=? AND room_id=?", (ann_id, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
-def delete_announcement(ann_id:int, room_id:str, actor_id:int):
+def delete_announcement(ann_id:int, room_id:str):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
-    r = cur.fetchone()
-    if not r: conn.close(); return False
-    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
-        conn.close(); return False
     cur.execute("DELETE FROM announcements WHERE id=? AND room_id=?", (ann_id, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
