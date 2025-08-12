@@ -235,18 +235,25 @@ def render_expenses(rid, members):
 
     st.markdown("### 지출 목록 / 통계")
     exps = DB.list_expenses(rid)
-    if not exps:
-        st.info("지출 내역이 없습니다.")
-        return
+    def row_get(row, key, default=None):
+    # sqlite3.Row는 .get이 없으므로 keys()로 확인해서 안전하게 꺼낸다
+        try:
+            if hasattr(row, "keys") and key in row.keys():
+                val = row[key]
+                return default if (val is None or val == "") else val
+        except Exception:
+            pass
+        return default
 
     df_exp_raw = pd.DataFrame([{
-        "id": e["id"],
-        "day": e["day"],
-        "place": e["place"],
-        "payer": (e["payer_nick"] or e["payer_name"]),
-        "amount": float(e["amount"] or 0),
-        "category": e.get("category", "기타"),
-        "memo": e.get("memo","")
+        "id":       e["id"],
+        "day":      e["day"] or "",
+        "place":    e["place"] or "",
+        # category 컬럼이 DB에 없어도 안전하게 "기타"로 세팅
+        "category": row_get(e, "category", "기타"),
+        "payer":    (e["payer_nick"] or e["payer_name"]),
+        "amount":   float(e["amount"] or 0),
+        "memo":     e["memo"] or "",
     } for e in exps])
 
     df_exp_raw["amount"] = pd.to_numeric(df_exp_raw["amount"], errors="coerce").fillna(0)
