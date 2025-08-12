@@ -5,16 +5,14 @@ from planner_core import best_windows, optimize_route
 from email_utils import send_reset_email
 from streamlit_folium import st_folium
 import folium
-from folium.features import DivIcon
+from geopy.geocoders import Nominatim
 
-# 차트(예산 요약)
-import matplotlib.pyplot as plt
-
-# 장소 검색(없어도 동작하도록 보호)
+# (선택) 카테고리 파이차트용 - 설치가 안 되어 있으면 막대 그래프로 대체
 try:
-    from geopy.geocoders import Nominatim
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
 except Exception:
-    Nominatim = None
+    HAS_MPL = False
 
 st.set_page_config(page_title="친구 약속 잡기", layout="wide")
 DB.init_db()
@@ -35,19 +33,13 @@ STATUS_SYMBOL  = {"off":"×","eve":"3","pm":"5","am":"7","full":"F"}
 STATUS_KO      = {"off":"불가","eve":"3시간/모름","pm":"5시간","am":"7시간","full":"하루종일"}
 def level_rank(s): return {"off":0,"eve":1,"pm":2,"am":3,"full":4}.get(s,0)
 
-def badge(status, text=None):
-    c = COLOR[status]; t = text or c["label"]
-    return f'<span style="background:{c["bg"]};color:{c["fg"]};padding:4px 8px;border-radius:8px;">{t}</span>'
-
 def legend():
     st.markdown("""
 <style>
 .badge{padding:6px 10px;border-radius:999px;margin-right:6px;display:inline-block;font-weight:700}
-/* 모바일 padding 보정 */
-@media (max-width: 600px){
-  .badge{font-size:12px}
+@media (max-width: 480px){
+  .mobile-hide{display:none;}
 }
-.final-day { box-shadow: inset 0 0 0 2px #ff4b4b!important; }
 </style>
     """, unsafe_allow_html=True)
     for s in ["off","eve","pm","am","full"]:
@@ -78,8 +70,7 @@ def build_person_day_map(days_seq, names_by_day):
             pmap[n].setdefault(d,"off")
     return persons, pmap
 
-def render_availability_matrix(days_seq, names_by_day, title=None, note=None, max_rows=None, highlight_days=None):
-    highlight_days = set(highlight_days or [])
+def render_availability_matrix(days_seq, names_by_day, title=None, note=None, max_rows=None):
     persons, pmap = build_person_day_map(days_seq, names_by_day)
     if max_rows: persons = persons[:max_rows]
     header = "".join(
@@ -94,10 +85,9 @@ def render_availability_matrix(days_seq, names_by_day, title=None, note=None, ma
             s = pmap[n][d]; c = COLOR[s]
             sym = STATUS_SYMBOL[s]
             tip = f"{n} · {d} · {STATUS_KO[s]}"
-            hl = 'class="final-day"' if d in highlight_days else ""
             cells.append(
                 f'<td title="{tip}" style="text-align:center;padding:2px 3px;">'
-                f'<div {hl} style="width:24px;height:18px;border-radius:5px;background:{c["bg"]};color:{c["fg"]};'
+                f'<div style="width:24px;height:18px;border-radius:5px;background:{c["bg"]};color:{c["fg"]};'
                 f'display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px">{sym}</div>'
                 f'</td>'
             )
@@ -144,7 +134,8 @@ def merge_overlapping_windows(raw_top, agg_by_day, quorum: int):
             cur["end"]  = max(cur["end"], nxt["end"])
             cur["days"] |= nxt["days"]
         else:
-            merged.append(cur); cur = nxt
+            merged.append(cur)
+            cur = nxt
     merged.append(cur)
     out = []
     for m in merged:
@@ -219,6 +210,73 @@ def require_login():
     if "user_id" not in st.session_state:
         st.session_state["page"]="auth"; _rerun()
 
+# ---------------- 지출 렌더 (날짜/카테고리 요약 + 삭제) ----------------
+def render_expenses(rid, members):
+    st.subheader("지출 입력")
+    room, _, _, _ = DB.day_aggregate(rid)
+    days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
+    exp_day = st.selectbox("날짜", days_options, key="exp_day")
+    x1,x2,x3,x4,x5 = st.columns([1.2,1,1,1.2,1.1])
+    with x1: place_n = st.text_input("장소(선택 입력)", key="exp_place")
+    with x2: payer    = st.selectbox("결제자", options=[(m["id"], (m["nickname"] or m["name"])) for m in members],
+                                     format_func=lambda x: x[1], key="exp_payer")
+    with x3: amt      = st.number_input("금액(원)", 0, step=1000, key="exp_amt")
+    with x4: memo     = st.text_input("메모", key="exp_memo")
+    with x5:
+        cat = st.selectbox("카테고리", ["식사","숙소","놀기","카페","쇼핑","기타"], key="exp_cat")
+    if st.button("지출 추가", key="exp_add"):
+        # DB에 category 컬럼 반영된 버전이어야 함(없다면 DB 스키마에 column 추가)
+        try:
+            DB.add_expense(rid, exp_day, place_n or "", payer[0], float(amt), memo or "", category=cat)
+        except TypeError:
+            # 구버전 호환: category 인자 없는 경우 그냥 저장
+            DB.add_expense(rid, exp_day, place_n or "", payer[0], float(amt), memo or "")
+        st.success("지출 추가됨"); _rerun()
+
+    st.markdown("### 지출 목록 / 통계")
+    exps = DB.list_expenses(rid)
+    if not exps:
+        st.info("지출 내역이 없습니다.")
+        return
+
+    df_exp_raw = pd.DataFrame([{
+        "id": e["id"],
+        "day": e["day"],
+        "place": e["place"],
+        "payer": (e["payer_nick"] or e["payer_name"]),
+        "amount": float(e["amount"] or 0),
+        "category": e.get("category", "기타"),
+        "memo": e.get("memo","")
+    } for e in exps])
+
+    df_exp_raw["amount"] = pd.to_numeric(df_exp_raw["amount"], errors="coerce").fillna(0)
+    df_exp_raw["day"] = pd.to_datetime(df_exp_raw["day"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    df_view = df_exp_raw.rename(columns={
+        "day":"날짜","place":"장소","payer":"결제자","amount":"금액","category":"카테고리","memo":"메모"
+    })
+    st.dataframe(df_view[["id","날짜","장소","결제자","금액","카테고리","메모"]], hide_index=True, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        by_day = df_exp_raw.groupby("day", dropna=False)["amount"].sum().reset_index().sort_values("day")
+        st.markdown("#### 📅 날짜별 지출 합계")
+        st.dataframe(by_day.rename(columns={"day":"날짜","amount":"합계(원)"}), hide_index=True, use_container_width=True)
+    with c2:
+        by_cat = df_exp_raw.groupby("category", dropna=False)["amount"].sum().reset_index().sort_values("amount", ascending=False)
+        st.markdown("#### 🥧 카테고리별 지출 비중")
+        if HAS_MPL:
+            fig, ax = plt.subplots()
+            ax.pie(by_cat["amount"], labels=by_cat["category"], autopct="%1.0f%%")
+            ax.axis("equal")
+            st.pyplot(fig)
+        else:
+            st.bar_chart(by_cat.set_index("category")["amount"])
+
+    delx = st.number_input("지출 삭제 ID", min_value=0, step=1, value=0, key="exp_del_id")
+    if st.button("지출 삭제", key="exp_del_btn") and delx>0:
+        DB.delete_expense(int(delx), rid); st.success("삭제됨"); _rerun()
+
 # ---------------- Dashboard ----------------
 def dashboard():
     require_login()
@@ -276,22 +334,27 @@ def room_page():
         st.session_state.pop("room_id", None)
         _rerun(); return
 
-    user_id = st.session_state["user_id"]
-    is_owner = (room["owner_id"] == user_id)
-    is_admin = DB.is_site_admin(user_id)
-    can_manage = is_owner or is_admin  # ✅ 관리자=방장 권한
+    is_owner = (room["owner_id"] == st.session_state["user_id"])
+    # 사이트 관리자 여부(있으면 True)
+    try:
+        is_admin = bool(DB.is_site_admin(st.session_state["user_id"]))
+    except Exception:
+        is_admin = False
+    is_manager = (is_owner or is_admin)
+
     # 헤더 + 레전드
     st.header(f"방: {room['title']} ({rid})")
     st.caption(f"{room['start']} ~ {room['end']} / 최소{room['min_days']}일 / 쿼럼{room['quorum']}")
 
-    # 최종 선택 표시 + 강조
-    final_days_set = set()
+    # 최종 선택 표시(강조)
     if room["final_start"] and room["final_end"]:
-        st.success(f"✅ 최종 확정: **{room['final_start']} ~ {room['final_end']}**")
-        s = dt.date.fromisoformat(room["final_start"]); e = dt.date.fromisoformat(room["final_end"])
-        cur=s
-        while cur<=e:
-            final_days_set.add(cur.isoformat()); cur+=dt.timedelta(days=1)
+        st.markdown(
+            f"""
+<div style="padding:10px 12px;border:2px solid #7c3aed;border-radius:12px;background:#faf5ff">
+  <b>✅ 최종 확정</b>:
+  <span style="font-weight:700">{room['final_start']} ~ {room['final_end']}</span>
+</div>
+""", unsafe_allow_html=True)
 
     legend()
 
@@ -308,8 +371,7 @@ def room_page():
             for a in anns:
                 st.markdown(f"**{a['title']}**  · {a['created_at'][:16].replace('T',' ')}")
                 st.caption(a["body"])
-                # 고정/삭제는 관리자 또는 방장만
-                if can_manage:
+                if is_manager:
                     c1,c2 = st.columns(2)
                     with c1:
                         if st.button(("고정 해제" if a["pinned"] else "고정"), key=f"pin_{a['id']}"):
@@ -318,17 +380,17 @@ def room_page():
                         if st.button("삭제", key=f"delann_{a['id']}"):
                             DB.delete_announcement(a["id"], rid, room["owner_id"]); _rerun()
                 st.markdown("---")
-        # 공지 생성은 멤버도 가능
-        st.caption("새 공지")
-        ann_title = st.text_input("제목", key="ann_title_sb")
-        ann_body  = st.text_area("내용", key="ann_body_sb")
-        ann_pin   = st.checkbox("고정(관리자/방장만 반영)", value=False, key="ann_pin_sb")
-        if st.button("등록", key="ann_add_sb"):
-            if ann_title.strip():
-                DB.add_announcement(rid, ann_title.strip(), ann_body.strip(), int(ann_pin if can_manage else 0), user_id)
-                st.success("등록됨"); _rerun()
-            else:
-                st.error("제목은 필수예요.")
+        if is_manager:
+            st.caption("새 공지")
+            ann_title = st.text_input("제목", key="ann_title_sb")
+            ann_body  = st.text_area("내용", key="ann_body_sb")
+            ann_pin   = st.checkbox("고정", value=False, key="ann_pin_sb")
+            if st.button("등록", key="ann_add_sb"):
+                if ann_title.strip():
+                    DB.add_announcement(rid, ann_title.strip(), ann_body.strip(), int(ann_pin), st.session_state["user_id"])
+                    st.success("등록됨"); _rerun()
+                else:
+                    st.error("제목은 필수예요.")
         st.markdown("---")
 
         st.subheader("🗳 투표")
@@ -339,42 +401,42 @@ def room_page():
             for p in polls:
                 st.markdown(f"**{p['question']}**" + (f" · 마감 {p['closes_at'][:16].replace('T',' ')}" if p["closes_at"] else ""))
                 opts = DB.list_poll_options(p["id"])
-                my_votes = set(DB.get_user_votes(p["id"], user_id))
+                my_votes = set(DB.get_user_votes(p["id"], st.session_state["user_id"]))
                 if p["is_multi"]:
                     picked = st.multiselect("선택", [o["id"] for o in opts], default=list(my_votes),
                                             format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
                 else:
                     all_ids = [o["id"] for o in opts]
-                    idx = all_ids.index(next(iter(my_votes))) if my_votes else 0 if all_ids else 0
-                    picked = st.radio("선택", all_ids, index=idx if all_ids else 0,
-                                      format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid) if all_ids else str, key=f"pv_{p['id']}")
+                    idx = (all_ids.index(next(iter(my_votes))) if my_votes else 0) if all_ids else 0
+                    picked = st.radio("선택", all_ids, index=idx if all_ids else None,
+                                      format_func=lambda oid: next(o["text"] for o in opts if o["id"]==oid), key=f"pv_{p['id']}")
                     picked = [picked] if all_ids else []
                 if st.button("투표/변경", key=f"vote_{p['id']}"):
-                    DB.cast_vote(p["id"], picked, user_id, bool(p["is_multi"]))
+                    DB.cast_vote(p["id"], picked, st.session_state["user_id"], bool(p["is_multi"]))
                     st.success("반영됨"); _rerun()
                 counts, total = DB.tally_poll(p["id"])
                 for o in opts:
                     c = counts.get(o["id"], 0); ratio = (c/total*100) if total else 0
                     st.progress(min(1.0, ratio/100.0), text=f"{o['text']} · {c}표 ({ratio:0.0f}%)")
                 st.markdown("---")
-        # 투표 만들기 — 멤버도 가능
-        with st.expander("새 투표 만들기", expanded=False):
-            q = st.text_input("질문", key="newpoll_q")
-            raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
-            multi = st.checkbox("다중 선택", value=False, key="newpoll_multi")
-            closes = st.date_input("마감일(선택)", value=None, key="newpoll_date")
-            if st.button("투표 생성", key="newpoll_make"):
-                options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
-                closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
-                if q.strip() and options:
-                    DB.create_poll(rid, q.strip(), int(multi), options, closes_at, user_id)
-                    st.success("투표 생성!"); _rerun()
-                else:
-                    st.error("질문과 보기 필요")
+        if is_manager:
+            with st.expander("새 투표 만들기", expanded=False):
+                q = st.text_input("질문", key="newpoll_q")
+                raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
+                multi = st.checkbox("다중 선택", value=False, key="newpoll_multi")
+                closes = st.date_input("마감일(선택)", value=None, key="newpoll_date")
+                if st.button("투표 생성", key="newpoll_make"):
+                    options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
+                    closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
+                    if q.strip() and options:
+                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, st.session_state["user_id"])
+                        st.success("투표 생성!"); _rerun()
+                    else:
+                        st.error("질문과 보기 필요")
 
     # ---- 방장/관리자 관리 ----
-    if can_manage:
-        with st.expander("👑 방 관리", expanded=False):
+    if is_manager:
+        with st.expander("👑 방 관리 (관리자/방장)", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1: new_title = st.text_input("제목", room["title"])
             with c2: start = st.date_input("시작", dt.date.fromisoformat(room["start"]))
@@ -409,8 +471,8 @@ def room_page():
                         ok, msg = DB.invite_user_by_email(rid, email_str)
                         (st.success if ok else st.error)(str(msg)); _rerun()
             with b3:
-                # ✅ 방장/관리자 모두 삭제 가능
-                if st.button("⚠️ 방 삭제", type="secondary", key="room_delete"):
+                # 방장 + 관리자 모두 삭제 가능 (DB.delete_room은 owner_id만 맞으면 삭제됨)
+                if st.button("⚠️ 방 삭제 (관리자/방장)", type="secondary", key="room_delete"):
                     DB.delete_room(rid, room["owner_id"])
                     st.success("방 삭제 완료")
                     st.session_state["page"] = "dashboard"
@@ -446,7 +508,7 @@ def room_page():
     # ========== ⏰ 시간/약속 ==========
     with tab_time:
         st.subheader("내 달력 입력")
-        my_av = DB.get_my_availability(user_id, rid)
+        my_av = DB.get_my_availability(st.session_state["user_id"], rid)
 
         # 범위 → DataFrame
         days = []
@@ -484,18 +546,18 @@ def room_page():
         c1,c2,c3 = st.columns(3)
         with c1:
             if st.button("저장", key="time_save"):
-                DB.upsert_availability(user_id, rid, payload)
-                DB.set_submitted(user_id, rid, False)
+                DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                DB.set_submitted(st.session_state["user_id"], rid, False)
                 st.success("저장 완료(미제출)"); _rerun()
         with c2:
             if st.button("제출(Submit)", key="time_submit"):
-                DB.upsert_availability(user_id, rid, payload)
-                DB.set_submitted(user_id, rid, True)
+                DB.upsert_availability(st.session_state["user_id"], rid, payload)
+                DB.set_submitted(st.session_state["user_id"], rid, True)
                 st.success("제출 완료"); _rerun()
         with c3:
             if st.button("내 입력 삭제", key="time_clear"):
-                DB.clear_my_availability(user_id, rid)
-                DB.set_submitted(user_id, rid, False)
+                DB.clear_my_availability(st.session_state["user_id"], rid)
+                DB.set_submitted(st.session_state["user_id"], rid, False)
                 st.success("입력을 비웠습니다."); _rerun()
 
         st.markdown("#### 제출 현황")
@@ -540,20 +602,20 @@ def room_page():
         if raw_top:
             merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
             st.markdown("### ⭐ 추천 Top‑7 (겹치거나 붙는 구간은 하나로 합침)")
+
             def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
                 feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
+                cols = st.columns([5,2]) if show_select_button else None
                 if show_select_button:
-                    colL, colR = st.columns([5,2])
-                    with colL:
+                    with cols[0]:
                         st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
-                    with colR:
+                    with cols[1]:
                         if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
                             DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
                             st.success("최종 일정으로 저장했습니다."); _rerun()
                 else:
                     st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
 
-                # 멤버 기여
                 K = len(days_seq)
                 stats = {}; all_names=set()
                 for d in days_seq:
@@ -578,14 +640,14 @@ def room_page():
                 # 미니 매트릭스
                 render_availability_matrix(
                     days_seq, names_by_day,
-                    title="사람×날짜 가능수준 (F/7/5/3/×)",
-                    note="칸에 마우스를 올리면 상태 툴팁이 보여요.",
-                    highlight_days=final_days_set
+                    title=("미니 달력(대안 구간 상세)" if small else "사람×날짜 가능수준 (F/7/5/3/×)"),
+                    note=("칸에 마우스를 올리면 상태 툴팁이 보여요." if small else None),
+                    max_rows=(8 if small else None)
                 )
 
             for i, w in enumerate(merged_top[:7], 1):
                 st.write(f"**#{i}**")
-                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=can_manage)
+                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_manager)
         else:
             st.info("추천할 구간이 아직 없어요. 인원 입력을 더 받아보세요.")
         if DB.all_submitted(rid):
@@ -596,97 +658,128 @@ def room_page():
             render_availability_matrix(
                 days_list, names_by_day,
                 title="전체 기간 타임라인 (F/7/5/3/×)",
-                note="이름/날짜 헤더는 스크롤해도 고정됩니다.",
-                highlight_days=final_days_set
+                note="이름/날짜 헤더는 스크롤해도 고정됩니다."
             )
 
     # ========== 🗺️ 계획 & 동선 / 예산 ==========
     with tab_plan:
-        left, right = st.columns([1.1, 1.2])
+        left, right = st.columns([1.05, 1])
 
-        # 날짜 선택 없음 + 표에서 '날짜' 컬럼 편집 가능
         days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
-        pick_day = st.selectbox("날짜 선택(지도/미리보기)", days_options, index=0, key="plan_day")
+        pick_day = st.selectbox("날짜 선택", days_options, index=0, key="plan_day")
 
         with left:
             st.subheader("계획표 (날짜·순서·시간·카테고리·장소·예산)")
 
             with st.expander("📍 장소 검색해서 추가", expanded=False):
                 q = st.text_input("장소/주소 검색", key="plan_q")
-                cA,cB,cC = st.columns([2,1,1])
+                cA,cB,cC,cD = st.columns([2,1,1,1])
                 with cA: cat = st.selectbox("카테고리", ["식사","숙소","놀기","카페","쇼핑","기타"], key="plan_cat")
                 with cB: bud = st.number_input("예산(원)", 0, step=1000, value=0, key="plan_budget")
                 with cC: is_anchor = st.checkbox("숙소/고정", value=False, key="plan_anchor")
+                with cD: sel_day = st.selectbox("날짜", days_options, index=(days_options.index(pick_day) if pick_day in days_options else 0), key="plan_sel_day")
                 if st.button("검색 & 추가", key="plan_add"):
                     if not q.strip():
                         st.error("검색어를 입력하세요.")
                     else:
-                        lat = lon = None
-                        if Nominatim is not None:
-                            try:
-                                geoloc = Nominatim(user_agent="youchin").geocode(q)
-                                lat, lon = (geoloc.latitude, geoloc.longitude) if geoloc else (None, None)
-                            except Exception:
-                                lat, lon = (None, None)
-                        DB.add_item(rid, pick_day, q.strip(), cat, lat, lon, bud, None, None, is_anchor, None, user_id)
+                        try:
+                            geoloc = Nominatim(user_agent="youchin").geocode(q)
+                            lat, lon = (geoloc.latitude, geoloc.longitude) if geoloc else (None, None)
+                        except Exception:
+                            lat, lon = (None, None)
+                        DB.add_item(rid, sel_day, q.strip(), cat, lat, lon, bud, None, None, is_anchor, None, st.session_state["user_id"])
                         st.success("추가됨"); _rerun()
 
-            # 전체 기간 아이템 불러오기 → 표에서 날짜도 편집
-            rows_all = []
-            for d in days_options:
-                rows_all.extend(DB.list_items(rid, d))
-
+            rows = DB.list_items(rid, pick_day)
             table = []
-            for r in rows_all:
+            for r in rows:
                 table.append({
-                    "id": r["id"], "day": r["day"], "position": r["position"], "번호": 0,
+                    "id": r["id"], "position": r["position"], "번호": 0,
+                    "day": r["day"],
                     "start_time": r["start_time"] or "", "end_time": r["end_time"] or "",
                     "category": r["category"], "name": r["name"],
                     "budget": float(r["budget"] or 0)
                 })
             df_plan = pd.DataFrame(table)
             if not df_plan.empty:
-                df_plan = df_plan.sort_values(["day","position"]).reset_index(drop=True)
-                # 같은 날짜 내 표시 번호
-                df_plan["번호"] = df_plan.groupby("day").cumcount()+1
+                df_plan = df_plan.sort_values("position").reset_index(drop=True)
+                df_plan["번호"] = range(1, len(df_plan)+1)
 
             if df_plan.empty:
-                st.info("계획이 없습니다. 위에서 장소를 검색/추가하세요.")
+                st.info("이 날짜의 계획이 없습니다. 위에서 장소를 검색/추가하세요.")
             else:
                 edited = st.data_editor(
                     df_plan,
                     column_config={
                         "id": st.column_config.TextColumn("ID", disabled=True),
                         "번호": st.column_config.NumberColumn("번호(표시용)", disabled=True),
-                        "day": st.column_config.SelectboxColumn("날짜", options=days_options),
                         "position": st.column_config.NumberColumn("순서", min_value=1, step=1),
+                        "day": st.column_config.SelectboxColumn("날짜", options=days_options),
                         "start_time": st.column_config.TextColumn("시작", help="예: 10:00"),
                         "end_time": st.column_config.TextColumn("종료", help="예: 12:00"),
                         "category": st.column_config.SelectboxColumn("카테고리", options=["식사","숙소","놀기","카페","쇼핑","기타"]),
                         "name": st.column_config.TextColumn("장소"),
                         "budget": st.column_config.NumberColumn("예산(원)", step=1000),
                     },
-                    hide_index=True, use_container_width=True, key="plan_editor_full"
+                    hide_index=True, use_container_width=True, key="plan_editor"
                 )
 
-                d1, d2, d3 = st.columns(3)
+                d1, d2, d3, d4 = st.columns(4)
                 with d1:
-                    if st.button("저장(계획/날짜/순서 함께)", key="plan_save_anyday"):
-                        DB.bulk_save_items_anyday(rid, edited.to_dict("records"))
+                    if st.button("저장(계획)", key="plan_save"):
+                        DB.bulk_save_positions(rid, pick_day, edited.to_dict("records"))
                         st.success("저장 완료"); _rerun()
                 with d2:
-                    if st.button("자동 동선 추천(선택한 날짜만)", key="plan_opt"):
+                    if st.button("자동 동선 추천(순서 재배치)", key="plan_opt"):
                         items_for_route = [{
                             "id": r["id"], "lat": r["lat"], "lon": r["lon"], "is_anchor": r["is_anchor"]
                         } for r in DB.list_items(rid, pick_day)]
                         order_ids = optimize_route(items_for_route)
-                        DB.reorder_positions(rid, pick_day, order_ids)
+                        new_rows=[]; p=1
+                        for oid in order_ids:
+                            row = next(rr for rr in edited.to_dict("records") if rr["id"]==oid)
+                            row["position"]=p; new_rows.append(row); p+=1
+                        DB.bulk_save_positions(rid, pick_day, new_rows)
                         st.success("동선 정렬 완료!"); _rerun()
                 with d3:
                     del_id = st.number_input("삭제할 ID", min_value=0, step=1, value=0, key="plan_del_id")
                     if st.button("선택 ID 삭제", key="plan_del_btn") and del_id>0:
                         DB.delete_item(int(del_id), rid)
+                        rest = DB.list_items(rid, pick_day)
+                        rest_sorted = sorted(rest, key=lambda x: x["position"])
+                        repacked = []
+                        p = 1
+                        for it in rest_sorted:
+                            repacked.append({
+                                "id": it["id"], "position": p,
+                                "start_time": it["start_time"] or "",
+                                "end_time": it["end_time"] or "",
+                                "category": it["category"], "name": it["name"],
+                                "budget": float(it["budget"] or 0)
+                            })
+                            p += 1
+                        if repacked:
+                            DB.bulk_save_positions(rid, pick_day, repacked)
                         st.success("삭제 및 순서 재정렬 완료"); _rerun()
+                with d4:
+                    st.caption("지도에서 마커 클릭 → 아래에서 ↑/↓")
+                    clicked_id = st.session_state.get("clicked_item_id")
+                    if clicked_id:
+                        st.info(f"선택된 ID: {clicked_id}")
+                        if st.button("선택 항목 ↑", key="route_up"):
+                            recs = edited.to_dict("records")
+                            idx = next((i for i,r in enumerate(recs) if r["id"]==clicked_id), None)
+                            if idx is not None and idx>0:
+                                recs[idx]["position"], recs[idx-1]["position"] = recs[idx-1]["position"], recs[idx]["position"]
+                                DB.bulk_save_positions(rid, pick_day, recs)
+                                st.success("위로 이동"); _rerun()
+                        if st.button("선택 항목 ↓", key="route_down"):
+                            recs = edited.to_dict("records")
+                            idx = next((i for i,r in enumerate(recs) if r["id"]==clicked_id), None)
+                            if idx is not None and idx < len(recs)-1:
+                                recs[idx]["position"], recs[idx+1]["position"] = recs[idx+1]["position"], recs[idx]["position"]
+                                DB.bulk_save_positions(rid, pick_day, recs)
+                                st.success("아래로 이동"); _rerun()
 
         with right:
             st.subheader("동선 지도")
@@ -702,96 +795,49 @@ def room_page():
                 for i,it in enumerate(items_sorted, start=1):
                     if it["lat"] and it["lon"]:
                         coords.append((it["lat"], it["lon"]))
-                        label = f"{i}"
-                        popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
-                        # 숫자 오버레이
+                        order_num = i
+                        # 숫자 라벨이 보이는 아이콘
                         folium.map.Marker(
                             [it["lat"], it["lon"]],
-                            icon=DivIcon(icon_size=(18,18),
-                                icon_anchor=(9,9),
-                                html=f'<div style="background:#4F46E5;color:#fff;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">{label}</div>')
+                            icon=folium.DivIcon(html=f"""<div style="font-weight:800;color:#1f2937;background:#fff;padding:2px 6px;border-radius:12px;border:1px solid #ddd">{order_num}</div>"""),
                         ).add_to(m)
-                        # 클릭 마커
-                        folium.Marker(
-                            [it["lat"], it["lon"]],
-                            popup=popup, tooltip=popup,
-                            icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")
+                        popup = f"{order_num}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원 (ID:{it['id']})"
+                        # 실제 클릭용 마커(투명)
+                        folium.CircleMarker(
+                            location=[it["lat"], it["lon"]],
+                            radius=8, color="#6366f1", fill=True, fill_opacity=0.2, popup=popup, tooltip=popup
                         ).add_to(m)
                 if len(coords)>=2:
                     folium.PolyLine(coords, weight=4, opacity=0.8).add_to(m)
-                st_folium(m, height=520, width=None)
+                ret = st_folium(m, height=520, width=None)
+                # 지도 클릭 → 가장 가까운 아이템을 선택한 걸로 처리
+                if ret and ret.get("last_clicked"):
+                    lat = ret["last_clicked"]["lat"]; lon = ret["last_clicked"]["lng"]
+                    # 최근접 아이템 찾기
+                    def dist2(a,b): return (a[0]-b[0])**2 + (a[1]-b[1])**2
+                    nearest = None; best = 1e18
+                    for it in items_sorted:
+                        if it["lat"] and it["lon"]:
+                            d2 = dist2((lat,lon),(it["lat"],it["lon"]))
+                            if d2 < best:
+                                best = d2; nearest = it
+                    if nearest:
+                        st.session_state["clicked_item_id"] = nearest["id"]
+                        st.toast(f"선택: {nearest['name']} (ID:{nearest['id']})", icon="✅")
 
     # ========== 💳 정산 ==========
     with tab_cost:
         left, right = st.columns([1.2, 1])
-
         with left:
-            st.subheader("지출 입력")
-            days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
-            exp_day = st.selectbox("날짜", days_options, key="exp_day")
-            x1,x2,x3,x4 = st.columns([1.2,1,1,1.2])
-            with x1: place_n = st.text_input("장소(선택 입력)", key="exp_place")
-            with x2: payer    = st.selectbox("결제자", options=[(m["id"], (m["nickname"] or m["name"])) for m in members],
-                                             format_func=lambda x: x[1], key="exp_payer")
-            with x3: amt      = st.number_input("금액(원)", 0, step=1000, key="exp_amt")
-            with x4: memo     = st.text_input("메모", key="exp_memo")
-            if st.button("지출 추가", key="exp_add"):
-                DB.add_expense(rid, exp_day, place_n or "", payer[0], float(amt), memo or "")
-                st.success("지출 추가됨"); _rerun()
-
-            st.markdown("### 지출 목록")
-            exps = DB.list_expenses(rid)
-            if exps:
-                st.dataframe(
-                    pd.DataFrame([{
-                        "id":e["id"], "날짜":e["day"], "장소":e["place"],
-                        "결제자": (e["payer_nick"] or e["payer_name"]),
-                        "금액": int(e["amount"]), "메모": e["memo"] or ""
-                    } for e in exps]),
-                    hide_index=True, use_container_width=True
-                )
-                delx = st.number_input("지출 삭제 ID", min_value=0, step=1, value=0, key="exp_del_id")
-                if st.button("지출 삭제", key="exp_del_btn") and delx>0:
-                    DB.delete_expense(int(delx), rid); st.success("삭제됨"); _rerun()
-            else:
-                st.info("지출 내역이 없습니다.")
-
+            render_expenses(rid, members)
         with right:
-            st.subheader("정산 요약 & 차트")
+            st.subheader("정산 요약")
             transfers, total = DB.settle_transfers(rid)
             per_head = int(total / max(1, len(members)))
             st.caption(f"총 지출: **{int(total)}원** · 인당 **{per_head}원**")
-
-            # 날짜별 합계
-            exps = DB.list_expenses(rid)
-            if exps:
-                df_exp = pd.DataFrame(exps)
-                by_day = df_exp.groupby("day")["amount"].sum().reset_index().sort_values("day")
-                st.write("**날짜별 합계**")
-                st.dataframe(
-                    by_day.rename(columns={"day":"날짜","amount":"합계(원)"}).assign(**{"합계(원)":lambda x: x["합계(원)"].astype(int)}),
-                    hide_index=True, use_container_width=True
-                )
-                # 카테고리별 원형차트: itinerary 카테고리와 매칭은 없으니 메모/장소 기준 대신 단일 합산 -> 옵션:
-                # 여기서는 expenses에 카테고리가 없으니, '장소' 문자열에서 분류하기 어렵다.
-                # 대안: 계획표 카테고리와 join은 복잡하므로 우선 '장소' 없이 전체 합계 파이 차트는 의미 적음.
-                # 요청 반영 위해 카테고리를 '지출 메모'에 [식사]/[숙소]/.. 태그로 적으면 분리 가능하지만 기본은 전체합계 파이 X.
-                # 대신 "계획 카테고리별 예산" 파이 제공:
-                plan_rows = []
-                for d in pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d"):
-                    plan_rows.extend(DB.list_items(rid, d))
-                if plan_rows:
-                    df_plan_budget = pd.DataFrame([{"category":r["category"], "budget":float(r["budget"] or 0)} for r in plan_rows])
-                    pie = df_plan_budget.groupby("category")["budget"].sum().reset_index()
-                    pie = pie[pie["budget"]>0]
-                    if not pie.empty:
-                        fig = plt.figure()
-                        plt.pie(pie["budget"], labels=pie["category"], autopct="%1.0f%%")
-                        st.pyplot(fig, clear_figure=True)
-            else:
+            if not transfers:
                 st.info("정산할 항목이 아직 없어요.")
-
-            if transfers:
+            else:
                 name_of = {m["id"]: (m["nickname"] or m["name"]) for m in members}
                 st.write("**이체 추천 목록 (최소 이체 수)**")
                 for t in transfers:
@@ -805,6 +851,7 @@ def router():
     else:
         if page == "dashboard": dashboard()
         elif page == "room": room_page()
-        else: st.session_state["page"]="dashboard"; dashboard()
+        else:
+            st.session_state["page"]="dashboard"; dashboard()
 
 router()
