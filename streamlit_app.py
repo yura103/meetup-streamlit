@@ -163,7 +163,7 @@ def login_ui():
         pw = st.text_input("비밀번호", type="password")
         if st.button("로그인"):
             user, msg = AUTH.login_user(login_id, pw)
-            if not user: st.error(msg)
+            if not user: st.error(str(msg))
             else:
                 st.session_state.update(
                     user_id=user["id"], user_name=user["name"],
@@ -181,7 +181,7 @@ def login_ui():
             if len(nickname.strip())<2: st.error("닉네임을 2자 이상 입력하세요."); st.stop()
             if len(pw2)<6: st.error("비밀번호는 6자 이상"); st.stop()
             ok,msg = AUTH.register_user(email2, name, nickname, pw2)
-            st.success(msg) if ok else st.error(msg)
+            (st.success if ok else st.error)(str(msg))
 
     with tabs[2]:
         fp_email = st.text_input("가입 이메일")
@@ -205,7 +205,7 @@ def login_ui():
             if status=="ok": st.success("변경되었습니다. 로그인하세요.")
             else:
                 msg = {"not_found":"토큰이 올바르지 않아요.","used":"이미 사용됨","expired":"만료됨"}.get(status,"토큰 오류")
-                st.error(msg)
+                st.error(str(msg))
 
 def logout():
     for k in ("user_id","user_name","user_email","user_nick","page","room_id"): st.session_state.pop(k, None)
@@ -273,7 +273,7 @@ def room_page():
 
     is_owner = (room["owner_id"] == st.session_state["user_id"])
     is_admin = DB.is_site_admin(st.session_state["user_id"])
-    is_manager = is_owner or is_admin  # 👉 관리자도 방장급 권한
+    can_manage_room = (is_owner or is_admin)
 
     # 헤더 + 레전드
     st.header(f"방: {room['title']} ({rid})")
@@ -298,16 +298,16 @@ def room_page():
             for a in anns:
                 st.markdown(f"**{a['title']}**  · {a['created_at'][:16].replace('T',' ')}")
                 st.caption(a["body"])
-                if is_manager:  # 👈 관리자 가능
+                if (is_owner or is_admin):
                     c1,c2 = st.columns(2)
                     with c1:
                         if st.button(("고정 해제" if a["pinned"] else "고정"), key=f"pin_{a['id']}"):
-                            DB.toggle_pin_announcement(a["id"], rid, room["owner_id"]); _rerun()
+                            DB.toggle_pin_announcement(a["id"], rid, st.session_state["user_id"]); _rerun()
                     with c2:
                         if st.button("삭제", key=f"delann_{a['id']}"):
-                            DB.delete_announcement(a["id"], rid, room["owner_id"]); _rerun()
+                            DB.delete_announcement(a["id"], rid, st.session_state["user_id"]); _rerun()
                 st.markdown("---")
-        if is_manager:  # 👈 관리자 가능
+        if (is_owner or is_admin):
             st.caption("새 공지")
             ann_title = st.text_input("제목", key="ann_title_sb")
             ann_body  = st.text_area("내용", key="ann_body_sb")
@@ -346,24 +346,11 @@ def room_page():
                     c = counts.get(o["id"], 0); ratio = (c/total*100) if total else 0
                     st.progress(min(1.0, ratio/100.0), text=f"{o['text']} · {c}표 ({ratio:0.0f}%)")
                 st.markdown("---")
-        if is_manager:  # 👈 관리자 가능
-            with st.expander("새 투표 만들기", expanded=False):
-                q = st.text_input("질문", key="newpoll_q")
-                raw_opts = st.text_area("보기들(줄바꿈)", key="newpoll_opts")
-                multi = st.checkbox("다중 선택", value=False, key="newpoll_multi")
-                closes = st.date_input("마감일(선택)", value=None, key="newpoll_date")
-                if st.button("투표 생성", key="newpoll_make"):
-                    options = [s.strip() for s in (raw_opts or "").splitlines() if s.strip()]
-                    closes_at = (dt.datetime.combine(closes, dt.time(23,59)).isoformat() if closes else None)
-                    if q.strip() and options:
-                        DB.create_poll(rid, q.strip(), int(multi), options, closes_at, st.session_state["user_id"])
-                        st.success("투표 생성!"); _rerun()
-                    else:
-                        st.error("질문과 보기 필요")
+        # (투표 생성은 방 멤버도 가능하게 둘 수 있지만, 요청이 없어서 유지)
 
     # ---- 방장/관리자 관리 ----
-    if is_manager:
-        with st.expander("👑 방 관리 (방장+관리자)", expanded=False):
+    if can_manage_room:
+        with st.expander("👑 방 관리", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1: new_title = st.text_input("제목", room["title"])
             with c2: start = st.date_input("시작", dt.date.fromisoformat(room["start"]))
@@ -382,7 +369,7 @@ def room_page():
             with b1:
                 if st.button("설정 저장", key="owner_save"):
                     DB.update_room(
-                        room["owner_id"], rid,
+                        st.session_state["user_id"], rid,
                         title=new_title, start=start.isoformat(), end=end.isoformat(),
                         min_days=int(min_days), quorum=int(quorum),
                         w_full=wfull, w_am=wam, w_pm=wpm, w_eve=wev
@@ -399,14 +386,11 @@ def room_page():
                         (st.success if ok else st.error)(str(msg)); _rerun()
             with b3:
                 if st.button("⚠️ 방 삭제", type="secondary", key="room_delete"):
-                    ok = DB.delete_room(rid, st.session_state["user_id"])  # 👉 방장 or 관리자 가능
-                    if ok:
-                        st.success("방 삭제 완료")
-                        st.session_state["page"] = "dashboard"
-                        st.session_state.pop("room_id", None)
-                        _rerun()
-                    else:
-                        st.error("삭제 권한이 없습니다.")
+                    DB.delete_room(rid, st.session_state["user_id"])
+                    st.success("방 삭제 완료")
+                    st.session_state["page"] = "dashboard"
+                    st.session_state.pop("room_id", None)
+                    _rerun()
 
         st.markdown("#### 멤버 목록")
         st.dataframe(
@@ -531,6 +515,7 @@ def room_page():
         if raw_top:
             merged_top = merge_overlapping_windows(raw_top, agg, int(room_row["quorum"]))
             st.markdown("### ⭐ 추천 Top‑7 (겹치거나 붙는 구간은 하나로 합침)")
+
             def render_win_summary(days_seq, score, feasible, show_select_button=False, small=False):
                 feas = "충족" if feasible else "⚠️ 최소 인원 미충족 포함"
                 if show_select_button:
@@ -539,7 +524,7 @@ def room_page():
                         st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
                     with colR:
                         if st.button("이 구간 최종 선택", key=f"choose_{days_seq[0]}_{days_seq[-1]}"):
-                            DB.set_final_window(rid, room["owner_id"], days_seq[0], days_seq[-1])
+                            DB.set_final_window(rid, st.session_state["user_id"], days_seq[0], days_seq[-1])
                             st.success("최종 일정으로 저장했습니다."); _rerun()
                 else:
                     st.write(f"**{days_seq[0]} ~ {days_seq[-1]} | 점수 {score:.2f} | {feas}**")
@@ -567,7 +552,7 @@ def room_page():
 
             for i, w in enumerate(merged_top[:7], 1):
                 st.write(f"**#{i}**")
-                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=is_manager)
+                render_win_summary(w["days"], w["score"], w["feasible"], show_select_button=can_manage_room)
                 render_availability_matrix(
                     w["days"], names_by_day,
                     title="사람×날짜 가능수준 (F/7/5/3/×)",
@@ -701,7 +686,7 @@ def room_page():
                         coords.append((it["lat"], it["lon"]))
                         popup = f"{i}. {it['name']} · {it['category']} · 예산 {int(it['budget'])}원"
                         folium.Marker(
-                            [it["lat"] , it["lon"]],
+                            [it["lat"], it["lon"]],
                             popup=popup, tooltip=popup,
                             icon=folium.Icon(color="purple" if it["is_anchor"] else "blue")
                         ).add_to(m)

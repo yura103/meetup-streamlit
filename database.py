@@ -158,13 +158,13 @@ def init_db():
     );
     """)
 
-    # 사이트 관리자 테이블
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS site_admins(
-          user_id INTEGER PRIMARY KEY,
-          granted_at TEXT NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        )
+    # --- 사이트 관리자 ---
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS site_admins(
+      user_id INTEGER PRIMARY KEY,
+      granted_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
     """)
 
     # ---- 마이그레이션(컬럼 추가 보정) ----
@@ -183,28 +183,35 @@ def init_db():
 
     conn.commit(); conn.close()
 
-# ---- Admin helpers ----
+# ---- Site admin helpers ----
 def is_site_admin(user_id:int)->bool:
     if not user_id: return False
-    conn=get_conn(); cur=conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM site_admins WHERE user_id=?", (user_id,))
-        ok = cur.fetchone() is not None
-    except Exception:
-        ok = False
-    conn.close()
-    return ok
+    c=get_conn().cursor(); c.execute("SELECT 1 FROM site_admins WHERE user_id=?", (user_id,))
+    r=c.fetchone(); c.connection.close(); return bool(r)
 
 def grant_admin_by_email(email:str)->bool:
-    u = get_user_by_email(email)
+    u=get_user_by_email(email)
     if not u: return False
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS site_admins(
-        user_id INTEGER PRIMARY KEY, granted_at TEXT NOT NULL)""")
     cur.execute("INSERT OR IGNORE INTO site_admins(user_id,granted_at) VALUES(?,?)",
                 (u["id"], dt.datetime.utcnow().isoformat()))
-    conn.commit(); ch = cur.rowcount>=0; conn.close()
-    return ch
+    conn.commit(); ok = cur.rowcount>=1
+    conn.close(); return ok
+
+def revoke_admin_by_email(email:str)->bool:
+    u=get_user_by_email(email)
+    if not u: return False
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute("DELETE FROM site_admins WHERE user_id=?", (u["id"],))
+    conn.commit(); ok = cur.rowcount>=1
+    conn.close(); return ok
+
+def list_site_admins():
+    c=get_conn().cursor()
+    c.execute("""SELECT u.id,u.email,COALESCE(u.nickname,u.name) AS name,s.granted_at
+                 FROM site_admins s JOIN users u ON u.id=s.user_id
+                 ORDER BY s.granted_at DESC""")
+    rows=c.fetchall(); c.connection.close(); return rows
 
 # ---- Auth primitives ----
 def hash_pw(pw:str)->bytes:
@@ -287,31 +294,33 @@ def create_room(owner_id:int, title:str, start:str, end:str, min_days:int, quoru
                 (owner_id,rid,"owner"))
     conn.commit(); conn.close(); return rid
 
-def update_room(owner_id:int, room_id:str, **fields):
+def update_room(actor_id:int, room_id:str, **fields):
     if not fields: return False
-    keys, vals = [], []
-    for k,v in fields.items():
-        if k in ("title","start","end","min_days","quorum","w_full","w_am","w_pm","w_eve","final_start","final_end"):
-            keys.append(f"{k}=?"); vals.append(v)
-    if not keys: return False
-    vals += [owner_id, room_id]
-    conn=get_conn(); cur=conn.cursor()
-    cur.execute(f"UPDATE rooms SET {', '.join(keys)} WHERE owner_id=? AND id=?", vals)
-    conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
-
-def delete_room(room_id:str, actor_id:int):
     conn=get_conn(); cur=conn.cursor()
     cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
     row = cur.fetchone()
     if not row:
         conn.close(); return False
-    owner_id = row["owner_id"]
-
-    # 권한: 방장 또는 사이트 관리자
-    is_admin = is_site_admin(actor_id)
-    if actor_id != owner_id and not is_admin:
+    if not (row["owner_id"] == actor_id or is_site_admin(actor_id)):
         conn.close(); return False
+    keys, vals = [], []
+    for k,v in fields.items():
+        if k in ("title","start","end","min_days","quorum","w_full","w_am","w_pm","w_eve","final_start","final_end"):
+            keys.append(f"{k}=?"); vals.append(v)
+    if not keys:
+        conn.close(); return False
+    vals.append(room_id)
+    cur.execute(f"UPDATE rooms SET {', '.join(keys)} WHERE id=?", vals)
+    conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
+def delete_room(room_id:str, actor_id:int):
+    conn=get_conn(); cur=conn.cursor()
+    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close(); return False
+    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
+        conn.close(); return False
     cur.execute("DELETE FROM rooms WHERE id=?", (room_id,))
     if cur.rowcount:
         cur.execute("DELETE FROM memberships WHERE room_id=?", (room_id,))
@@ -321,7 +330,7 @@ def delete_room(room_id:str, actor_id:int):
         cur.execute("DELETE FROM announcements WHERE room_id=?", (room_id,))
         cur.execute("DELETE FROM polls WHERE room_id=?", (room_id,))
         cur.execute("DELETE FROM poll_options WHERE poll_id NOT IN (SELECT id FROM polls)")
-        cur.execute("DELETE FROM poll_votes   WHERE poll_id NOT IN (SELECT id FROM polls)")
+        cur.execute("DELETE FROM poll_votes WHERE poll_id NOT IN (SELECT id FROM polls)")
     conn.commit(); conn.close(); return True
 
 def list_my_rooms(user_id:int):
@@ -410,6 +419,7 @@ def day_aggregate(room_id:str):
     return room, days, agg, w
 
 def availability_names_by_day(room_id:str):
+    """{day:{status:[names...]}}"""
     conn=get_conn(); cur=conn.cursor()
     cur.execute("""SELECT a.day, a.status, COALESCE(u.nickname, u.name) AS name
                    FROM availability a JOIN users u ON u.id=a.user_id
@@ -425,10 +435,16 @@ def availability_names_by_day(room_id:str):
     return out
 
 # 최종 확정 기간
-def set_final_window(room_id:str, owner_id:int, start:str, end:str)->bool:
+def set_final_window(room_id:str, actor_id:int, start:str, end:str)->bool:
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("UPDATE rooms SET final_start=?, final_end=? WHERE id=? AND owner_id=?",
-                (start, end, room_id, owner_id))
+    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close(); return False
+    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
+        conn.close(); return False
+    cur.execute("UPDATE rooms SET final_start=?, final_end=? WHERE id=?",
+                (start, end, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
 def get_final_window(room_id:str):
@@ -530,17 +546,23 @@ def list_announcements(room_id:str):
                  ORDER BY pinned DESC, created_at DESC""", (room_id,))
     rows=c.fetchall(); c.connection.close(); return rows
 
-def toggle_pin_announcement(ann_id:int, room_id:str, owner_id:int):
+def toggle_pin_announcement(ann_id:int, room_id:str, actor_id:int):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT 1 FROM rooms WHERE id=? AND owner_id=?", (room_id, owner_id))
-    if not cur.fetchone(): conn.close(); return False
+    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
+    r = cur.fetchone()
+    if not r: conn.close(); return False
+    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
+        conn.close(); return False
     cur.execute("UPDATE announcements SET pinned=1-pinned WHERE id=? AND room_id=?", (ann_id, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
-def delete_announcement(ann_id:int, room_id:str, owner_id:int):
+def delete_announcement(ann_id:int, room_id:str, actor_id:int):
     conn=get_conn(); cur=conn.cursor()
-    cur.execute("SELECT 1 FROM rooms WHERE id=? AND owner_id=?", (room_id, owner_id))
-    if not cur.fetchone(): conn.close(); return False
+    cur.execute("SELECT owner_id FROM rooms WHERE id=?", (room_id,))
+    r = cur.fetchone()
+    if not r: conn.close(); return False
+    if not (r["owner_id"] == actor_id or is_site_admin(actor_id)):
+        conn.close(); return False
     cur.execute("DELETE FROM announcements WHERE id=? AND room_id=?", (ann_id, room_id))
     conn.commit(); ok=cur.rowcount>0; conn.close(); return ok
 
