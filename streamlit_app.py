@@ -811,8 +811,42 @@ def room_page():
     # ========== 💳 정산 ==========
     with tab_cost:
         left, right = st.columns([1.2, 1])
+
         with left:
+            # ---- 지출 입력 폼 (복구) ----
+            st.subheader("지출 입력")
+            days_options = pd.date_range(room["start"], room["end"]).strftime("%Y-%m-%d").tolist()
+            exp_day = st.selectbox("날짜", days_options, key="exp_day")
+            c1, c2 = st.columns([1.2, 1])
+            with c1:
+                place_n = st.text_input("장소(선택 입력)", key="exp_place")
+            with c2:
+                payer = st.selectbox(
+                    "결제자",
+                    options=[(m["id"], (m["nickname"] or m["name"])) for m in members],
+                    format_func=lambda x: x[1],
+                    key="exp_payer"
+                )
+            c3, c4 = st.columns([1, 1.2])
+            with c3:
+                amt = st.number_input("금액(원)", 0, step=1000, key="exp_amt")
+            with c4:
+                memo = st.text_input("메모", key="exp_memo")
+
+            # 카테고리를 DB에 저장하지 않는 스키마라면 화면 용도로만 사용(옵션)
+            category = st.selectbox("카테고리", ["식사", "숙소", "놀기", "카페", "쇼핑", "기타"], key="exp_cat")
+
+            if st.button("지출 추가", key="exp_add"):
+                # 현재 DB 스키마가 category 컬럼이 없으면 아래 add_expense 그대로 사용
+                DB.add_expense(rid, exp_day, place_n or "", payer[0], float(amt), memo or "")
+                st.success("지출 추가됨")
+                _rerun()
+
+            st.markdown("---")
+
+            # ---- 목록/그래프 출력 ----
             render_expenses(rid, members)
+
         with right:
             st.subheader("정산 요약")
             transfers, total = DB.settle_transfers(rid)
